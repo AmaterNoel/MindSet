@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+
+# Local model checkpoints and generated artifacts.
+save_pt/
+output/
+output_smoke/
+
+# Dataset/model binaries should stay outside git.
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.nii
+*.nii.gz
+*.mgz
+
+# Local environment files.
+.env
+.venv/
+venv/
+.idea/
