@@ -10,6 +10,7 @@ output_smoke/
 *.pt
 *.pth
 *.ckpt
+*.npy
 *.safetensors
 *.bin
 *.nii

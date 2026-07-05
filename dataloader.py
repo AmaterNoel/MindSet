@@ -5,14 +5,13 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-import nibabel as nib
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
 
 DEFAULT_NSD_ROOT = Path(r"D:\datasets\NSD")
-DEFAULT_BETAS_DIR = DEFAULT_NSD_ROOT / "subj01" / "func1pt8mm"
+DEFAULT_BETAS_PATH = DEFAULT_NSD_ROOT / "subj01" / "betas_float16.npy"
 DEFAULT_PROCESS_DIR = DEFAULT_NSD_ROOT / "annotations" / "process"
 DEFAULT_LABEL_PATH = DEFAULT_PROCESS_DIR / "nsd_subj01_labels.jsonl"
 DEFAULT_FEATURE_PATH = DEFAULT_PROCESS_DIR / "nsd_subj01_features.pt"
@@ -74,21 +73,12 @@ def deterministic_group_split(
     return [i for i, record in enumerate(records) if record[group_key] in selected]
 
 
-def load_roi_mask(mask_path: Path, spatial_shape: tuple[int, int, int]) -> np.ndarray:
-    mask = np.load(mask_path)
-    if mask.shape == spatial_shape:
-        return mask.astype(bool)
-    if mask.ndim == 3 and mask.transpose(2, 1, 0).shape == spatial_shape:
-        return mask.transpose(2, 1, 0).astype(bool)
-    raise ValueError(f"ROI mask shape {mask.shape} does not match beta spatial shape {spatial_shape}.")
-
-
-def normalize_volume(volume: np.ndarray, mode: str, mask: np.ndarray | None) -> np.ndarray:
+def normalize_volume(volume: np.ndarray, mode: str) -> np.ndarray:
     if mode == "none":
         return volume
-    if mode not in {"volume", "masked"}:
+    if mode != "volume":
         raise ValueError(f"Unknown normalize mode: {mode}")
-    valid = mask if mode == "masked" and mask is not None else np.isfinite(volume)
+    valid = np.isfinite(volume)
     values = volume[valid]
     if values.size == 0:
         return volume
@@ -97,8 +87,6 @@ def normalize_volume(volume: np.ndarray, mode: str, mask: np.ndarray | None) -> 
     if std < 1e-6:
         std = 1.0
     volume = (volume - mean) / std
-    if mask is not None:
-        volume = volume * mask
     return volume
 
 
@@ -107,20 +95,19 @@ class NSDConceptDataset(Dataset):
         self,
         label_path: Path = DEFAULT_LABEL_PATH,
         feature_path: Path = DEFAULT_FEATURE_PATH,
-        betas_dir: Path = DEFAULT_BETAS_DIR,
+        betas_path: Path = DEFAULT_BETAS_PATH,
         split: SplitName = "train",
         group_key: str = "nsd_id",
         train_ratio: float = 0.8,
         val_ratio: float = 0.1,
         seed: int = 42,
-        roi_mask_path: Path | None = None,
-        normalize: str = "masked",
+        normalize: str = "volume",
         labels: list[dict[str, Any]] | None = None,
         features: dict[str, Any] | None = None,
     ) -> None:
         self.label_path = Path(label_path)
         self.feature_path = Path(feature_path)
-        self.betas_dir = Path(betas_dir)
+        self.betas_path = Path(betas_path)
         self.split = split
         self.group_key = group_key
         self.normalize = normalize
@@ -147,27 +134,25 @@ class NSDConceptDataset(Dataset):
         if len(self.labels) != len(self.global_trials):
             raise ValueError(f"Label count {len(self.labels)} != feature trial count {len(self.global_trials)}.")
 
-        self._nifti_cache: dict[int, nib.Nifti1Image] = {}
-        first_beta = self.betas_dir / "betas_session01.nii.gz"
-        if not first_beta.exists():
-            raise FileNotFoundError(f"Missing beta file: {first_beta}")
-        spatial_shape = nib.load(str(first_beta)).shape[:3]
-        self.roi_mask = load_roi_mask(roi_mask_path, spatial_shape) if roi_mask_path is not None else None
+        if not self.betas_path.exists():
+            raise FileNotFoundError(f"Missing beta cache: {self.betas_path}")
+        self.betas = np.load(self.betas_path, mmap_mode="r")
+        if self.betas.ndim != 4:
+            raise ValueError(f"Expected beta cache shape [trials, x, y, z], got {self.betas.shape}.")
+        if self.betas.shape[0] < len(self.labels):
+            raise ValueError(f"Beta cache has {self.betas.shape[0]} trials but labels contain {len(self.labels)}.")
 
     def __len__(self) -> int:
         return len(self.indices)
 
+    @staticmethod
+    def _trial_row(session: int, beta_index: int) -> int:
+        return (session - 1) * 750 + beta_index
+
     def _load_beta_volume(self, session: int, beta_index: int) -> np.ndarray:
-        if session not in self._nifti_cache:
-            beta_path = self.betas_dir / f"betas_session{session:02d}.nii.gz"
-            if not beta_path.exists():
-                raise FileNotFoundError(f"Missing beta file: {beta_path}")
-            self._nifti_cache[session] = nib.load(str(beta_path))
-        img = self._nifti_cache[session]
-        volume = np.asarray(img.dataobj[..., beta_index], dtype=np.float32)
-        if self.roi_mask is not None:
-            volume = volume * self.roi_mask
-        volume = normalize_volume(volume, self.normalize, self.roi_mask)
+        row = self._trial_row(session, beta_index)
+        volume = np.asarray(self.betas[row], dtype=np.float32)
+        volume = normalize_volume(volume, self.normalize)
         return volume
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -236,25 +221,23 @@ def collate_nsd_concepts(batch: list[dict[str, Any]]) -> dict[str, Any]:
 def create_datasets(
     label_path: Path = DEFAULT_LABEL_PATH,
     feature_path: Path = DEFAULT_FEATURE_PATH,
-    betas_dir: Path = DEFAULT_BETAS_DIR,
+    betas_path: Path = DEFAULT_BETAS_PATH,
     group_key: str = "nsd_id",
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
     seed: int = 42,
-    roi_mask_path: Path | None = None,
-    normalize: str = "masked",
+    normalize: str = "volume",
 ) -> tuple[NSDConceptDataset, NSDConceptDataset, NSDConceptDataset]:
     labels = load_jsonl(label_path)
     features = load_feature_file(feature_path)
     common = dict(
         label_path=label_path,
         feature_path=feature_path,
-        betas_dir=betas_dir,
+        betas_path=betas_path,
         group_key=group_key,
         train_ratio=train_ratio,
         val_ratio=val_ratio,
         seed=seed,
-        roi_mask_path=roi_mask_path,
         normalize=normalize,
         labels=labels,
         features=features,
@@ -304,7 +287,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Smoke test NSD concept dataloader.")
     parser.add_argument("--label-path", type=Path, default=DEFAULT_LABEL_PATH)
     parser.add_argument("--feature-path", type=Path, default=DEFAULT_FEATURE_PATH)
-    parser.add_argument("--betas-dir", type=Path, default=DEFAULT_BETAS_DIR)
+    parser.add_argument("--betas-path", type=Path, default=DEFAULT_BETAS_PATH)
     parser.add_argument("--split", choices=["train", "val", "test", "all"], default="train")
     parser.add_argument("--group-key", default="nsd_id")
     parser.add_argument("--seed", type=int, default=42)
@@ -312,20 +295,18 @@ def main() -> None:
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--roi-mask-path", type=Path, default=None)
-    parser.add_argument("--normalize", choices=["none", "volume", "masked"], default="masked")
+    parser.add_argument("--normalize", choices=["none", "volume"], default="volume")
     args = parser.parse_args()
 
     dataset = NSDConceptDataset(
         label_path=args.label_path,
         feature_path=args.feature_path,
-        betas_dir=args.betas_dir,
+        betas_path=args.betas_path,
         split=args.split,
         group_key=args.group_key,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         seed=args.seed,
-        roi_mask_path=args.roi_mask_path,
         normalize=args.normalize,
     )
     loader = DataLoader(

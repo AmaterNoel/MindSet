@@ -27,10 +27,16 @@ python process.py
 python train.py
 ```
 
-On a server, beta files can live outside the copied NSD annotation/surface folder:
+Build the single-file beta cache once:
+
+```powershell
+python prepare_betas_npy.py
+```
+
+On a server, the beta cache can live outside the copied NSD annotation/surface folder:
 
 ```bash
 python train.py \
   --nsd-root /path/to/NSD \
-  --betas-dir /server/existing/nsd/subj01/func1pt8mm
+  --betas-path /server/existing/nsd/subj01/betas_float16.npy
 ```

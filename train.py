@@ -24,7 +24,7 @@ from scipy.ndimage import map_coordinates
 from torch import nn
 
 from dataloader import (
-    DEFAULT_BETAS_DIR,
+    DEFAULT_BETAS_PATH,
     DEFAULT_FEATURE_PATH,
     DEFAULT_LABEL_PATH,
     DEFAULT_NSD_ROOT,
@@ -410,14 +410,13 @@ def train(args: argparse.Namespace) -> None:
         train_loader, val_loader, test_loader = create_dataloaders(
             label_path=args.label_path,
             feature_path=args.feature_path,
-            betas_dir=args.betas_dir,
+            betas_path=args.betas_path,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             group_key=args.group_key,
             train_ratio=args.train_ratio,
             val_ratio=args.val_ratio,
             seed=args.seed,
-            roi_mask_path=args.roi_mask_path,
             normalize=args.normalize,
         )
         print(f"dataset train={len(train_loader.dataset)} val={len(val_loader.dataset)} test={len(test_loader.dataset)}")
@@ -520,7 +519,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-path", type=Path, default=None)
     parser.add_argument("--feature-path", type=Path, default=None)
     parser.add_argument("--surface-root", type=Path, default=None)
-    parser.add_argument("--betas-dir", type=Path, default=None)
+    parser.add_argument("--betas-path", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
@@ -530,8 +529,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--group-key", default="nsd_id")
-    parser.add_argument("--roi-mask-path", type=Path, default=None)
-    parser.add_argument("--normalize", choices=["none", "volume", "masked"], default="masked")
+    parser.add_argument("--normalize", choices=["none", "volume"], default="volume")
 
     parser.add_argument("--base-channels", type=int, default=32)
     parser.add_argument("--token-dim", type=int, default=256)
@@ -563,7 +561,7 @@ def parse_args() -> argparse.Namespace:
     args.label_path = args.label_path or args.nsd_root / "annotations" / "process" / DEFAULT_LABEL_PATH.name
     args.feature_path = args.feature_path or args.nsd_root / "annotations" / "process" / DEFAULT_FEATURE_PATH.name
     args.surface_root = args.surface_root or args.nsd_root / "surface"
-    args.betas_dir = args.betas_dir or args.nsd_root / "subj01" / "func1pt8mm"
+    args.betas_path = args.betas_path or args.nsd_root / "subj01" / DEFAULT_BETAS_PATH.name
     return args
 
 
