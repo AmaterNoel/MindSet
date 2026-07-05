@@ -26,3 +26,11 @@ save_pt\openai__clip-vit-base-patch32
 python process.py
 python train.py
 ```
+
+On a server, beta files can live outside the copied NSD annotation/surface folder:
+
+```bash
+python train.py \
+  --nsd-root /path/to/NSD \
+  --betas-dir /server/existing/nsd/subj01/func1pt8mm
+```

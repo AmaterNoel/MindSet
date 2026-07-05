@@ -27,6 +27,7 @@ from dataloader import (
     DEFAULT_BETAS_DIR,
     DEFAULT_FEATURE_PATH,
     DEFAULT_LABEL_PATH,
+    DEFAULT_NSD_ROOT,
     NSDConceptDataset,
     collate_nsd_concepts,
     create_dataloaders,
@@ -37,7 +38,7 @@ from model import BrainConceptModelConfig, BrainToConceptModel
 
 PROJECT_ROOT = Path(r"D:\PycharmProjects\MindKeyAnimator")
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "output"
-DEFAULT_SURFACE_ROOT = Path(r"D:\datasets\NSD\surface")
+DEFAULT_SURFACE_ROOT = DEFAULT_NSD_ROOT / "surface"
 
 
 class Tee:
@@ -515,10 +516,11 @@ def train(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train NSD brain-to-global-and-concept CLIP model.")
-    parser.add_argument("--label-path", type=Path, default=DEFAULT_LABEL_PATH)
-    parser.add_argument("--feature-path", type=Path, default=DEFAULT_FEATURE_PATH)
-    parser.add_argument("--betas-dir", type=Path, default=DEFAULT_BETAS_DIR)
-    parser.add_argument("--surface-root", type=Path, default=DEFAULT_SURFACE_ROOT)
+    parser.add_argument("--nsd-root", type=Path, default=DEFAULT_NSD_ROOT)
+    parser.add_argument("--label-path", type=Path, default=None)
+    parser.add_argument("--feature-path", type=Path, default=None)
+    parser.add_argument("--surface-root", type=Path, default=None)
+    parser.add_argument("--betas-dir", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
@@ -557,7 +559,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-samples", type=int, default=5)
     parser.add_argument("--max-visual-concepts", type=int, default=20)
     parser.add_argument("--surface-layer", choices=["pial", "layerB1", "layerB2", "layerB3"], default="layerB2")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.label_path = args.label_path or args.nsd_root / "annotations" / "process" / DEFAULT_LABEL_PATH.name
+    args.feature_path = args.feature_path or args.nsd_root / "annotations" / "process" / DEFAULT_FEATURE_PATH.name
+    args.surface_root = args.surface_root or args.nsd_root / "surface"
+    args.betas_dir = args.betas_dir or args.nsd_root / "subj01" / "func1pt8mm"
+    return args
 
 
 if __name__ == "__main__":
