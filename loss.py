@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
 
 
 @dataclass
@@ -17,6 +18,8 @@ class BrainConceptLossConfig:
     global_temperature: float = 0.07
     concept_temperature: float = 0.07
     confidence_temperature: float = 1.0
+    concept_confidence_weight: float = 0.2
+    unmatched_confidence_weight: float = 0.05
     eps: float = 1e-6
 
 
@@ -61,28 +64,55 @@ def positive_concept_mil_loss(
     temperature: float = 0.07,
     confidence_temperature: float = 1.0,
     eps: float = 1e-6,
+    concept_confidence_weight: float = 0.2,
+    unmatched_confidence_weight: float = 0.05,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     query_clip = F.normalize(query_clip, dim=-1)
     concept_features = F.normalize(concept_features, dim=-1)
     sim = torch.einsum("bqd,bnd->bqn", query_clip, concept_features)
-    concept_mask_q = concept_mask[:, None, :].expand_as(sim)
 
-    concept_soft_best_per_query = temperature * masked_logsumexp(
-        sim / temperature,
-        concept_mask_q,
-        dim=2,
-        eps=eps,
-    )
-    log_conf = F.logsigmoid(query_confidence_logits / confidence_temperature)
-    query_scores = (concept_soft_best_per_query + log_conf) / temperature
-    sample_score = temperature * torch.logsumexp(query_scores, dim=1)
-    loss = (1.0 - sample_score).mean()
+    sample_losses: list[torch.Tensor] = []
+    matched_sims: list[torch.Tensor] = []
+    matched_counts: list[int] = []
+    for batch_idx in range(query_clip.shape[0]):
+        valid_concepts = torch.where(concept_mask[batch_idx])[0]
+        if valid_concepts.numel() == 0:
+            sample_losses.append(query_confidence_logits[batch_idx].new_tensor(0.0))
+            matched_counts.append(0)
+            continue
 
-    safe_sim = sim.masked_fill(~concept_mask_q, -1e4)
+        sample_sim = sim[batch_idx, :, valid_concepts]
+        row_ind, col_ind = linear_sum_assignment((-sample_sim.detach().cpu()).numpy())
+        query_idx = torch.as_tensor(row_ind, device=query_clip.device, dtype=torch.long)
+        concept_idx = torch.as_tensor(col_ind, device=query_clip.device, dtype=torch.long)
+
+        assigned_sim = sample_sim[query_idx, concept_idx]
+        align_loss = 1.0 - assigned_sim.mean()
+
+        logits = query_confidence_logits[batch_idx] / confidence_temperature
+        pos_conf_loss = F.binary_cross_entropy_with_logits(logits[query_idx], torch.ones_like(logits[query_idx]))
+        unmatched_mask = torch.ones_like(logits, dtype=torch.bool)
+        unmatched_mask[query_idx] = False
+        if unmatched_mask.any():
+            neg_logits = logits[unmatched_mask]
+            neg_conf_loss = F.binary_cross_entropy_with_logits(neg_logits, torch.zeros_like(neg_logits))
+        else:
+            neg_conf_loss = logits.new_tensor(0.0)
+
+        sample_losses.append(
+            align_loss + concept_confidence_weight * (pos_conf_loss + unmatched_confidence_weight * neg_conf_loss)
+        )
+        matched_sims.append(assigned_sim.detach().mean())
+        matched_counts.append(int(query_idx.numel()))
+
+    loss = torch.stack(sample_losses).mean()
+
+    safe_sim = sim.masked_fill(~concept_mask[:, None, :], -1e4)
     best_sim_per_query = safe_sim.max(dim=2).values
     confidence = torch.sigmoid(query_confidence_logits)
     return loss, {
-        "concept_sample_score": sample_score.detach().mean(),
+        "concept_matched_sim": torch.stack(matched_sims).mean() if matched_sims else sim.new_tensor(0.0),
+        "concept_matched_count": sim.new_tensor(float(sum(matched_counts) / max(len(matched_counts), 1))),
         "concept_best_query_sim": best_sim_per_query.max(dim=1).values.detach().mean(),
         "concept_confidence_mean": confidence.detach().mean(),
         "concept_active_count_05": (confidence > 0.5).float().sum(dim=1).detach().mean(),
@@ -140,6 +170,8 @@ class BrainConceptLoss(nn.Module):
             temperature=cfg.concept_temperature,
             confidence_temperature=cfg.confidence_temperature,
             eps=cfg.eps,
+            concept_confidence_weight=cfg.concept_confidence_weight,
+            unmatched_confidence_weight=cfg.unmatched_confidence_weight,
         )
         consistency_loss, consistency_metrics = concept_global_consistency_loss(
             outputs["global_clip"],
