@@ -22,13 +22,13 @@ SESSION_COUNT = 40
 TRIALS_PER_SESSION = 750
 MAX_VERB_PHRASE_WORDS = 6
 
-PHRASE_STOP_HEADS = {
+TEMPLATE_WRAPPER_HEADS = {
     "image",
     "photo",
     "picture",
-    "scene",
     "view",
 }
+GENERIC_SINGLE_PHRASES = TEMPLATE_WRAPPER_HEADS | {"scene"}
 KEEP_SINGLE_POS = {"NOUN", "PROPN"}
 VERB_POS = {"VERB"}
 OBJECT_DEPS = {"dobj", "obj", "attr", "oprd", "pobj"}
@@ -60,6 +60,28 @@ def normalize_phrase(text: str) -> str:
     return text
 
 
+def unwrap_template_prefix(text: str) -> str:
+    words = normalize_phrase(text).split()
+    if len(words) > 2 and words[0] in TEMPLATE_WRAPPER_HEADS and words[1] == "of":
+        return " ".join(words[2:])
+    return " ".join(words)
+
+
+def is_caption_template_phrase(words: list[str]) -> bool:
+    if not words:
+        return True
+    if words[-1] not in TEMPLATE_WRAPPER_HEADS:
+        return False
+    text = " ".join(words)
+    if text.startswith(("seen in this ", "seen in the ", "pictured in this ", "taken in this ", "taken in this very ")):
+        return True
+    if any(pattern in text for pattern in (" seen in this ", " pictured in this ", " taken in this ", " taken in this very ")):
+        return True
+    if text.startswith(("bottom of the ", "background of this ", "background of this image ")):
+        return True
+    return False
+
+
 def is_stop_phrase(text: str, stopwords: set[str], min_phrase_chars: int) -> bool:
     text = normalize_phrase(text)
     if len(text) < min_phrase_chars:
@@ -69,7 +91,9 @@ def is_stop_phrase(text: str, stopwords: set[str], min_phrase_chars: int) -> boo
         return True
     if all(word in stopwords for word in words):
         return True
-    if words[-1] in PHRASE_STOP_HEADS:
+    if is_caption_template_phrase(words):
+        return True
+    if len(words) == 1 and words[0] in GENERIC_SINGLE_PHRASES:
         return True
     if words[-1] in {"and", "or", "with", "of", "in", "on", "under", "over", "near", "beside"}:
         return True
@@ -77,7 +101,7 @@ def is_stop_phrase(text: str, stopwords: set[str], min_phrase_chars: int) -> boo
 
 
 def add_unique(items: list[str], value: str, stopwords: set[str], min_phrase_chars: int) -> None:
-    value = normalize_phrase(value)
+    value = unwrap_template_prefix(value)
     if is_stop_phrase(value, stopwords, min_phrase_chars):
         return
     if value not in items:
@@ -102,15 +126,20 @@ def noun_chunk_core(chunk: Any) -> str:
 
 
 def noun_chunk_with_of_phrases(chunk: Any) -> list[str]:
-    phrases = [noun_chunk_core(chunk)]
     root = chunk.root
+    root_text = normalize_phrase(root.lemma_ if root.lemma_ != "-PRON-" else root.text)
+    phrases = [] if root_text in TEMPLATE_WRAPPER_HEADS else [noun_chunk_core(chunk)]
     for prep in root.children:
         if prep.dep_ != "prep" or prep.text.lower() != "of":
             continue
         for pobj in prep.children:
             if pobj.dep_ not in OBJECT_DEPS:
                 continue
-            phrases.append(f"{noun_chunk_core(chunk)} of {token_subtree_text(pobj)}")
+            pobj_text = token_subtree_text(pobj)
+            if root_text in TEMPLATE_WRAPPER_HEADS:
+                phrases.append(pobj_text)
+            else:
+                phrases.append(f"{noun_chunk_core(chunk)} of {pobj_text}")
     return phrases
 
 
@@ -125,7 +154,7 @@ def extract_caption_phrases(doc: Any, stopwords: set[str], min_phrase_chars: int
         if token.pos_ not in KEEP_SINGLE_POS:
             continue
         text = normalize_phrase(token.lemma_ if token.lemma_ != "-PRON-" else token.text)
-        if text in stopwords or text in PHRASE_STOP_HEADS:
+        if text in stopwords or text in GENERIC_SINGLE_PHRASES:
             continue
         add_unique(phrases, text, stopwords, min_phrase_chars)
 
