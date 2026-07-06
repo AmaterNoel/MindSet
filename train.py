@@ -84,7 +84,7 @@ def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[st
 
 
 def print_loss_line(prefix: str, metrics: dict[str, float]) -> None:
-    keys = ["total_loss", "global_loss", "concept_loss", "consistency_loss", "sparsity_loss"]
+    keys = ["total_loss", "global_loss", "concept_loss", "anchor_loss", "confidence_loss", "budget_loss"]
     body = " ".join(f"{key}={metrics.get(key, 0.0):.4f}" for key in keys)
     print(f"{prefix} {body}")
 
@@ -437,10 +437,18 @@ def train(args: argparse.Namespace) -> None:
             BrainConceptLossConfig(
                 global_weight=args.global_weight,
                 concept_weight=args.concept_weight,
-                consistency_weight=args.consistency_weight,
-                sparsity_weight=args.sparsity_weight,
+                budget_weight=args.budget_weight,
                 global_temperature=args.global_temperature,
-                concept_temperature=args.concept_temperature,
+                semantic_alpha=args.semantic_alpha,
+                label_tau=args.label_tau,
+                label_scale=args.label_scale,
+                query_tau=args.query_tau,
+                query_scale=args.query_scale,
+                min_label_weight=args.min_label_weight,
+                confidence_weight=args.confidence_weight,
+                budget_margin=args.budget_margin,
+                min_expected_count=args.min_expected_count,
+                max_expected_count=args.max_expected_count,
             )
         )
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -545,10 +553,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--global-weight", type=float, default=1.0)
     parser.add_argument("--concept-weight", type=float, default=1.0)
-    parser.add_argument("--consistency-weight", type=float, default=0.2)
-    parser.add_argument("--sparsity-weight", type=float, default=0.01)
+    parser.add_argument("--budget-weight", type=float, default=0.1)
     parser.add_argument("--global-temperature", type=float, default=0.07)
-    parser.add_argument("--concept-temperature", type=float, default=0.07)
+    parser.add_argument("--semantic-alpha", type=float, default=0.6)
+    parser.add_argument("--label-tau", type=float, default=0.20)
+    parser.add_argument("--label-scale", type=float, default=0.40)
+    parser.add_argument("--query-tau", type=float, default=0.25)
+    parser.add_argument("--query-scale", type=float, default=0.35)
+    parser.add_argument("--min-label-weight", type=float, default=0.20)
+    parser.add_argument("--confidence-weight", type=float, default=0.30)
+    parser.add_argument("--budget-margin", type=float, default=5.0)
+    parser.add_argument("--min-expected-count", type=float, default=3.0)
+    parser.add_argument("--max-expected-count", type=float, default=30.0)
 
     parser.add_argument("--val-interval", type=int, default=5)
     parser.add_argument("--confidence-threshold", type=float, default=0.5)
