@@ -28,7 +28,15 @@ TEMPLATE_WRAPPER_HEADS = {
     "picture",
     "view",
 }
-GENERIC_SINGLE_PHRASES = TEMPLATE_WRAPPER_HEADS | {"scene"}
+GENERIC_SINGLE_PHRASES = TEMPLATE_WRAPPER_HEADS | {
+    "area",
+    "background",
+    "foreground",
+    "middle",
+    "object",
+    "scene",
+    "thing",
+}
 KEEP_SINGLE_POS = {"NOUN", "PROPN"}
 VERB_POS = {"VERB"}
 OBJECT_DEPS = {"dobj", "obj", "attr", "oprd", "pobj"}
