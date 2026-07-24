@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import mimetypes
 import os
 import subprocess
+import threading
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -13,6 +16,7 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WEB_ROOT = PROJECT_ROOT / "dashboard_app"
+CACHE_ROOT = PROJECT_ROOT / "dashboard_cache"
 REMOTE_ROOT = "/data0/home/longnuoer/Projects/MindKeyAnimator"
 SSH_HOST = "server"
 TEXT_SUFFIXES = {
@@ -20,6 +24,9 @@ TEXT_SUFFIXES = {
     ".ini", ".cfg", ".sh", ".ps1", ".css", ".js", ".ts", ".tsx", ".html",
 }
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+PREFETCH_POOL = ThreadPoolExecutor(max_workers=3, thread_name_prefix="artifact-cache")
+PREFETCHED: set[str] = set()
+PREFETCH_LOCK = threading.Lock()
 
 
 def ssh(*args: str, binary: bool = False, timeout: int = 20) -> str | bytes:
@@ -118,6 +125,38 @@ def read_output(path: str, binary: bool = False) -> str | bytes:
     return ssh(f"cd {REMOTE_ROOT} && cat -- {relative}", binary=binary, timeout=30)
 
 
+def image_cache_path(path: str) -> Path:
+    relative = safe_relative(path)
+    if not relative.startswith("output/") or PurePosixPath(relative).suffix.lower() not in IMAGE_SUFFIXES:
+        raise ValueError("Unsupported image artifact")
+    digest = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:20]
+    return CACHE_ROOT / f"{digest}_{PurePosixPath(relative).name}"
+
+
+def cached_image(path: str) -> bytes:
+    destination = image_cache_path(path)
+    if destination.exists():
+        return destination.read_bytes()
+    body = read_output(path, binary=True)
+    assert isinstance(body, bytes)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + f".{os.getpid()}.{threading.get_ident()}.tmp")
+    temporary.write_bytes(body)
+    os.replace(temporary, destination)
+    return body
+
+
+def prefetch_images(paths: list[str]) -> None:
+    for path in paths:
+        if not path.endswith("_comparison.png"):
+            continue
+        with PREFETCH_LOCK:
+            if path in PREFETCHED:
+                continue
+            PREFETCHED.add(path)
+        PREFETCH_POOL.submit(cached_image, path)
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "MindSetDashboard/1.0"
 
@@ -142,15 +181,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 path = query.get("path", [""])[0]
                 self.send_json({"path": path, "content": read_source(path)})
             elif parsed.path == "/api/experiments":
-                self.send_json({"files": experiment_files()})
+                files = experiment_files()
+                prefetch_images(files)
+                self.send_json({"files": files})
             elif parsed.path == "/api/artifact":
                 path = query.get("path", [""])[0]
                 body = read_output(path, binary=False)
                 self.send_json({"path": path, "content": body})
             elif parsed.path == "/api/image":
                 path = query.get("path", [""])[0]
-                body = read_output(path, binary=True)
-                assert isinstance(body, bytes)
+                body = cached_image(path)
                 content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)

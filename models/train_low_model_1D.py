@@ -480,18 +480,12 @@ def save_fixed_split_reconstructions(
             stem = f"sample_{int(dataset_index):05d}_nsd_{int(metadata['nsd_id']):05d}"
             split_dir = run_dir / "samples" / split
             split_dir.mkdir(parents=True, exist_ok=True)
-            original_path = split_dir / f"{stem}_original.png"
-            reconstruction_path = split_dir / f"{stem}_reconstruction.png"
             comparison_path = split_dir / f"{stem}_comparison.png"
-            original.save(original_path)
-            reconstruction.save(reconstruction_path)
             save_original_pred_grid(original, reconstruction, comparison_path)
             manifest[split].append(
                 {
                     "dataset_index": int(dataset_index),
                     "nsd_id": int(metadata["nsd_id"]),
-                    "original": str(original_path.relative_to(run_dir)),
-                    "reconstruction": str(reconstruction_path.relative_to(run_dir)),
                     "comparison": str(comparison_path.relative_to(run_dir)),
                 }
             )

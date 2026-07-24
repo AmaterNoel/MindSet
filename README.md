@@ -49,6 +49,8 @@ python tools/dashboard_server.py
 Open `http://127.0.0.1:8765`. It reads GPU telemetry, tracked source files,
 metrics, and visual artifacts from the configured SSH server. It exposes no
 write, training, deletion, or shell endpoints and refuses non-loopback binds.
+Remote images are prefetched into the ignored local `dashboard_cache/` folder;
+subsequent page loads use the local cached copy.
 
 Build the single-file beta cache once:
 
