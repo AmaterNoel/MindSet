@@ -23,3 +23,4 @@ dashboard/
 .venv/
 venv/
 .idea/
+.vscode/

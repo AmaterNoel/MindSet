@@ -40,6 +40,16 @@ python -m http.server 8000 --directory .
 See `REMOTE_WORKFLOW.md` for the remote execution, artifact fetch, and safe
 cleanup workflow.
 
+Run the live, local-only, read-only server dashboard:
+
+```powershell
+python tools/dashboard_server.py
+```
+
+Open `http://127.0.0.1:8765`. It reads GPU telemetry, tracked source files,
+metrics, and visual artifacts from the configured SSH server. It exposes no
+write, training, deletion, or shell endpoints and refuses non-loopback binds.
+
 Build the single-file beta cache once:
 
 ```powershell
