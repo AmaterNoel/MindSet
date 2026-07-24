@@ -30,7 +30,7 @@ python train.py
 Build the single-file beta cache once:
 
 ```powershell
-python prepare_betas_npy.py
+python process\prepare_betas_npy.py
 ```
 
 On a server, the beta cache can live outside the copied NSD annotation/surface folder:

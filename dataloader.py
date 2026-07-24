@@ -17,6 +17,7 @@ DEFAULT_NSD_ROOT = Path(r"D:\datasets\NSD")
 DEFAULT_ANNOTATION_DIR = DEFAULT_NSD_ROOT / "annotations"
 DEFAULT_STIM_INFO_PATH = DEFAULT_ANNOTATION_DIR / "nsd_stim_info_merged.csv"
 DEFAULT_BETAS_PATH = DEFAULT_NSD_ROOT / "subj01" / "betas_float16.npy"
+DEFAULT_BETAS_1D_PATH = DEFAULT_NSD_ROOT / "subj01" / "betas_nsdgeneral_float16.npy"
 DEFAULT_CAPTION_EMBEDDINGS_PATH = DEFAULT_NSD_ROOT / "subj01" / "caption_text_embeddings.pt"
 DEFAULT_IMAGE_EMBEDDINGS_PATH = DEFAULT_NSD_ROOT / "subj01" / "image_embeddings.pt"
 DEFAULT_IMAGE_VAE_LATENTS_PATH = DEFAULT_NSD_ROOT / "subj01" / "image_vae_latents.pt"
@@ -32,6 +33,7 @@ DEFAULT_SPLIT_SEED = 42
 COCO_SPLITS = ("train2017", "val2017")
 
 SplitName = Literal["train", "val", "test", "all"]
+FmriFormat = Literal["3d", "1d"]
 
 
 def str2bool(value: str | bool) -> bool:
@@ -255,11 +257,13 @@ class NSDConceptDataset(Dataset):
         annotation_dir: Path = DEFAULT_ANNOTATION_DIR,
         stim_info_path: Path = DEFAULT_STIM_INFO_PATH,
         betas_path: Path = DEFAULT_BETAS_PATH,
+        betas_1d_path: Path = DEFAULT_BETAS_1D_PATH,
         caption_embeddings_path: Path = DEFAULT_CAPTION_EMBEDDINGS_PATH,
         image_embeddings_path: Path = DEFAULT_IMAGE_EMBEDDINGS_PATH,
         image_vae_latents_path: Path = DEFAULT_IMAGE_VAE_LATENTS_PATH,
         stimulus_h5_path: Path = DEFAULT_STIMULUS_H5_PATH,
         split: SplitName = "train",
+        fmri_format: FmriFormat = "3d",
         group_key: str = "nsd_id",
         train_ratio: float = DEFAULT_TRAIN_RATIO,
         val_ratio: float = DEFAULT_VAL_RATIO,
@@ -276,11 +280,13 @@ class NSDConceptDataset(Dataset):
         self.annotation_dir = Path(annotation_dir)
         self.stim_info_path = Path(stim_info_path)
         self.betas_path = Path(betas_path)
+        self.betas_1d_path = Path(betas_1d_path)
         self.caption_embeddings_path = Path(caption_embeddings_path)
         self.image_embeddings_path = Path(image_embeddings_path)
         self.image_vae_latents_path = Path(image_vae_latents_path)
         self.stimulus_h5_path = Path(stimulus_h5_path)
         self.split = split
+        self.fmri_format = fmri_format
         self.group_key = group_key
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
@@ -323,11 +329,14 @@ class NSDConceptDataset(Dataset):
             seed=self.seed,
         )
 
-        if not self.betas_path.exists():
-            raise FileNotFoundError(f"Missing beta cache: {self.betas_path}")
-        self.betas = np.load(self.betas_path, mmap_mode="r")
-        if self.betas.ndim != 4:
-            raise ValueError(f"Expected beta cache shape [trials, x, y, z], got {self.betas.shape}.")
+        selected_betas_path = self.betas_1d_path if self.fmri_format == "1d" else self.betas_path
+        if not selected_betas_path.exists():
+            raise FileNotFoundError(f"Missing beta cache: {selected_betas_path}")
+        self.betas = np.load(selected_betas_path, mmap_mode="r")
+        if self.fmri_format == "3d" and self.betas.ndim != 4:
+            raise ValueError(f"Expected 3D beta cache shape [trials, x, y, z], got {self.betas.shape}.")
+        if self.fmri_format == "1d" and self.betas.ndim != 2:
+            raise ValueError(f"Expected 1D beta cache shape [trials, voxels], got {self.betas.shape}.")
         max_beta_row = max(int(record["beta_row"]) for record in self.records)
         if max_beta_row >= self.betas.shape[0]:
             raise ValueError(f"Beta cache has {self.betas.shape[0]} rows but needs row {max_beta_row}.")
@@ -376,9 +385,9 @@ class NSDConceptDataset(Dataset):
     def __len__(self) -> int:
         return len(self.indices)
 
-    def _load_beta_volume(self, beta_row: int) -> np.ndarray:
-        volume = np.asarray(self.betas[beta_row], dtype=np.float32)
-        return normalize_volume(volume, self.normalize)
+    def _load_fmri(self, beta_row: int) -> np.ndarray:
+        fmri = np.asarray(self.betas[beta_row], dtype=np.float32)
+        return normalize_volume(fmri, self.normalize)
 
     def _load_image(self, label_index: int) -> torch.Tensor:
         if self._stimulus_h5 is None:
@@ -390,10 +399,13 @@ class NSDConceptDataset(Dataset):
         record_index = self.indices[index]
         record = self.records[record_index]
         label_index = int(record["label_index"])
-        fmri = self._load_beta_volume(int(record["beta_row"]))
+        fmri = self._load_fmri(int(record["beta_row"]))
+        fmri_tensor = torch.from_numpy(fmri.copy()).float()
+        if self.fmri_format == "3d":
+            fmri_tensor = fmri_tensor.unsqueeze(0)
 
         item: dict[str, Any] = {
-            "fmri": torch.from_numpy(fmri).unsqueeze(0).float(),
+            "fmri": fmri_tensor,
             "caption_text_embeddings": self.caption_text_embeddings[label_index].clone(),
             "image_embeddings": self.image_embeddings[label_index].clone(),
             "caption_mask": self.caption_mask[label_index].clone(),
@@ -441,10 +453,12 @@ def create_datasets(
     annotation_dir: Path = DEFAULT_ANNOTATION_DIR,
     stim_info_path: Path = DEFAULT_STIM_INFO_PATH,
     betas_path: Path = DEFAULT_BETAS_PATH,
+    betas_1d_path: Path = DEFAULT_BETAS_1D_PATH,
     caption_embeddings_path: Path = DEFAULT_CAPTION_EMBEDDINGS_PATH,
     image_embeddings_path: Path = DEFAULT_IMAGE_EMBEDDINGS_PATH,
     image_vae_latents_path: Path = DEFAULT_IMAGE_VAE_LATENTS_PATH,
     stimulus_h5_path: Path = DEFAULT_STIMULUS_H5_PATH,
+    fmri_format: FmriFormat = "3d",
     group_key: str = "nsd_id",
     train_ratio: float = DEFAULT_TRAIN_RATIO,
     val_ratio: float = DEFAULT_VAL_RATIO,
@@ -469,10 +483,12 @@ def create_datasets(
         annotation_dir=annotation_dir,
         stim_info_path=stim_info_path,
         betas_path=betas_path,
+        betas_1d_path=betas_1d_path,
         caption_embeddings_path=caption_embeddings_path,
         image_embeddings_path=image_embeddings_path,
         image_vae_latents_path=image_vae_latents_path,
         stimulus_h5_path=stimulus_h5_path,
+        fmri_format=fmri_format,
         group_key=group_key,
         train_ratio=train_ratio,
         val_ratio=val_ratio,
@@ -541,10 +557,12 @@ def main() -> None:
     parser.add_argument("--annotation-dir", type=Path, default=DEFAULT_ANNOTATION_DIR)
     parser.add_argument("--stim-info-path", type=Path, default=DEFAULT_STIM_INFO_PATH)
     parser.add_argument("--betas-path", type=Path, default=DEFAULT_BETAS_PATH)
+    parser.add_argument("--betas-1d-path", type=Path, default=DEFAULT_BETAS_1D_PATH)
     parser.add_argument("--caption-embeddings-path", type=Path, default=DEFAULT_CAPTION_EMBEDDINGS_PATH)
     parser.add_argument("--image-embeddings-path", type=Path, default=DEFAULT_IMAGE_EMBEDDINGS_PATH)
     parser.add_argument("--image-vae-latents-path", type=Path, default=DEFAULT_IMAGE_VAE_LATENTS_PATH)
     parser.add_argument("--stimulus-h5-path", type=Path, default=DEFAULT_STIMULUS_H5_PATH)
+    parser.add_argument("--fmri-format", choices=["3d", "1d"], default="3d")
     parser.add_argument("--split", choices=["train", "val", "test", "all"], default="train")
     parser.add_argument("--group-key", default="nsd_id")
     parser.add_argument("--seed", type=int, default=DEFAULT_SPLIT_SEED)
@@ -565,10 +583,12 @@ def main() -> None:
         annotation_dir=args.annotation_dir,
         stim_info_path=args.stim_info_path,
         betas_path=args.betas_path,
+        betas_1d_path=args.betas_1d_path,
         caption_embeddings_path=args.caption_embeddings_path,
         image_embeddings_path=args.image_embeddings_path,
         image_vae_latents_path=args.image_vae_latents_path,
         stimulus_h5_path=args.stimulus_h5_path,
+        fmri_format=args.fmri_format,
         group_key=args.group_key,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
@@ -587,10 +607,12 @@ def main() -> None:
             annotation_dir=args.annotation_dir,
             stim_info_path=args.stim_info_path,
             betas_path=args.betas_path,
+            betas_1d_path=args.betas_1d_path,
             caption_embeddings_path=args.caption_embeddings_path,
             image_embeddings_path=args.image_embeddings_path,
             image_vae_latents_path=args.image_vae_latents_path,
             stimulus_h5_path=args.stimulus_h5_path,
+            fmri_format=args.fmri_format,
             split="all",
             group_key=args.group_key,
             train_ratio=args.train_ratio,
