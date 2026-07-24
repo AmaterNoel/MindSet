@@ -441,6 +441,67 @@ def save_eval_reconstruction(
     save_original_pred_grid(original, pred, output_path)
 
 
+@torch.no_grad()
+def save_fixed_split_reconstructions(
+    model: Low1DModel,
+    datasets: dict[str, torch.utils.data.Dataset],
+    run_dir: Path,
+    device: torch.device,
+    enable_pool: bool,
+    pool_num: int,
+    pool_type: str,
+    image_size: int,
+    sample_count: int,
+) -> dict[str, list[dict[str, Any]]]:
+    model.eval()
+    manifest: dict[str, list[dict[str, Any]]] = {}
+    for split, dataset in datasets.items():
+        count = min(max(sample_count, 0), len(dataset))
+        indices = np.linspace(0, len(dataset) - 1, num=count, dtype=np.int64).tolist() if count else []
+        manifest[split] = []
+        for dataset_index in indices:
+            item = dataset[int(dataset_index)]
+            fmri = maybe_pool_fmri(
+                item["fmri"].unsqueeze(0).to(device),
+                enable_pool=enable_pool,
+                pool_num=pool_num,
+                pool_type=pool_type,
+            )
+            pred_rgb = model(fmri)["low_level_rgb"][0]
+            original_array = item["image"].numpy()
+            if original_array.ndim == 3 and original_array.shape[0] == 3:
+                original_array = np.transpose(original_array, (1, 2, 0))
+            original = Image.fromarray(np.asarray(original_array, dtype=np.uint8), mode="RGB")
+            reconstruction = tensor_to_pil(pred_rgb)
+            if reconstruction.size != (image_size, image_size):
+                reconstruction = reconstruction.resize((image_size, image_size), Image.Resampling.BICUBIC)
+
+            metadata = item["metadata"]
+            stem = f"sample_{int(dataset_index):05d}_nsd_{int(metadata['nsd_id']):05d}"
+            split_dir = run_dir / "samples" / split
+            split_dir.mkdir(parents=True, exist_ok=True)
+            original_path = split_dir / f"{stem}_original.png"
+            reconstruction_path = split_dir / f"{stem}_reconstruction.png"
+            comparison_path = split_dir / f"{stem}_comparison.png"
+            original.save(original_path)
+            reconstruction.save(reconstruction_path)
+            save_original_pred_grid(original, reconstruction, comparison_path)
+            manifest[split].append(
+                {
+                    "dataset_index": int(dataset_index),
+                    "nsd_id": int(metadata["nsd_id"]),
+                    "original": str(original_path.relative_to(run_dir)),
+                    "reconstruction": str(reconstruction_path.relative_to(run_dir)),
+                    "comparison": str(comparison_path.relative_to(run_dir)),
+                }
+            )
+    (run_dir / "samples" / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return manifest
+
+
 def save_jsonl(path: Path, payload: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -464,6 +525,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--eval-every", type=int, default=5)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=DEFAULT_SPLIT_SEED)
@@ -492,13 +554,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aux-cont-max-tokens", type=int, default=4096)
     parser.add_argument("--recon-image-size", type=int, default=256)
     parser.add_argument("--save-recon", type=str2bool, default=True)
+    parser.add_argument("--fixed-samples-per-split", type=int, default=5)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(args.device)
 
     run_name = args.run_name.strip() or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = args.output_root / run_name
@@ -755,6 +818,22 @@ def main() -> None:
     )
     with (run_dir / "test_metrics.json").open("w", encoding="utf-8") as f:
         json.dump(test_losses, f, ensure_ascii=False, indent=2)
+    if args.save_recon:
+        manifest = save_fixed_split_reconstructions(
+            model,
+            {"train": train_loader.dataset, "val": val_loader.dataset, "test": test_loader.dataset},
+            run_dir,
+            device,
+            enable_pool=args.enable_pool,
+            pool_num=args.pool_num,
+            pool_type=args.pool_type,
+            image_size=args.recon_image_size,
+            sample_count=args.fixed_samples_per_split,
+        )
+        print(
+            "saved fixed reconstructions "
+            + " ".join(f"{split}={len(samples)}" for split, samples in manifest.items())
+        )
     print(
         f"test_loss={test_losses['loss']:.6f} "
         f"test_low_l1={test_losses['low_l1']:.6f} "

@@ -94,7 +94,7 @@ def read_source(path: str) -> str:
 def experiment_files() -> list[str]:
     command = (
         f"cd {REMOTE_ROOT} && "
-        "find output -maxdepth 4 -type f "
+        "find output -maxdepth 6 -type f "
         "\\( -name metrics.jsonl -o -name config.json -o -name test_metrics.json "
         "-o -name '*.png' -o -name '*.jpg' -o -name '*.jpeg' -o -name '*.webp' \\) "
         "-printf '%T@|%p\\n' 2>/dev/null | sort -nr | head -1000"
