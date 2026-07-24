@@ -147,6 +147,13 @@ def cached_image(path: str) -> bytes:
 
 
 def prefetch_images(paths: list[str]) -> None:
+    def fetch(path: str) -> None:
+        try:
+            cached_image(path)
+        except (OSError, subprocess.SubprocessError):
+            with PREFETCH_LOCK:
+                PREFETCHED.discard(path)
+
     for path in paths:
         if not path.endswith("_comparison.png"):
             continue
@@ -154,7 +161,7 @@ def prefetch_images(paths: list[str]) -> None:
             if path in PREFETCHED:
                 continue
             PREFETCHED.add(path)
-        PREFETCH_POOL.submit(cached_image, path)
+        PREFETCH_POOL.submit(fetch, path)
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
