@@ -27,6 +27,19 @@ python process.py
 python train.py
 ```
 
+## Experiment dashboard
+
+Training entry points write one JSON object per split/epoch to
+`metrics.jsonl`. Build a local, dependency-free dashboard with:
+
+```powershell
+python tools/experiment_dashboard.py --output-root output build
+python -m http.server 8000 --directory .
+```
+
+See `REMOTE_WORKFLOW.md` for the remote execution, artifact fetch, and safe
+cleanup workflow.
+
 Build the single-file beta cache once:
 
 ```powershell

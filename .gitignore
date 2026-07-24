@@ -5,6 +5,7 @@ __pycache__/
 save_pt/
 output/
 output_smoke/
+dashboard/
 
 # Dataset/model binaries should stay outside git.
 *.pt

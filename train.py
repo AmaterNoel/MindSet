@@ -399,10 +399,21 @@ def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimiz
     torch.save({"epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "metrics": metrics}, path)
 
 
+def write_metric(path: Path, epoch: int | None, split: str, metrics: dict[str, float]) -> None:
+    row = {"epoch": epoch, "split": split, **metrics}
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def train(args: argparse.Namespace) -> None:
     run_name = datetime.now().strftime("%m%d%H%M")
     output_dir = args.output_root / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_dir / "metrics.jsonl"
+    (output_dir / "config.json").write_text(
+        json.dumps(vars(args), ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
     log_file = (output_dir / "train.log").open("w", encoding="utf-8")
     with contextlib.redirect_stdout(Tee(sys.stdout, log_file)), contextlib.redirect_stderr(Tee(sys.stderr, log_file)):
         print(json.dumps(vars(args), ensure_ascii=False, indent=2, default=str))
@@ -470,6 +481,7 @@ def train(args: argparse.Namespace) -> None:
                 avg.update(metrics, int(batch["fmri"].shape[0]))
             train_metrics = avg.compute()
             print_loss_line(f"epoch {epoch:04d} train", train_metrics)
+            write_metric(metrics_path, epoch, "train", train_metrics)
 
             if epoch % args.val_interval == 0 or epoch == args.epochs:
                 val_metrics = evaluate(
@@ -481,6 +493,7 @@ def train(args: argparse.Namespace) -> None:
                     args.concept_hit_threshold,
                 )
                 print_eval_line(f"epoch {epoch:04d} val", val_metrics)
+                write_metric(metrics_path, epoch, "val", val_metrics)
                 val_dir = output_dir / f"val_{epoch:04d}"
                 visualize_samples(
                     model,
@@ -506,6 +519,7 @@ def train(args: argparse.Namespace) -> None:
             args.concept_hit_threshold,
         )
         print_eval_line("test", test_metrics)
+        write_metric(metrics_path, args.epochs, "test", test_metrics)
         test_dir = output_dir / "test"
         visualize_samples(
             model,

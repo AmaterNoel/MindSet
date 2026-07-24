@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Literal
@@ -13,7 +14,8 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 
-DEFAULT_NSD_ROOT = Path(r"D:\datasets\NSD")
+_PLATFORM_NSD_ROOT = r"D:\datasets\NSD" if os.name == "nt" else "/data0/home/longnuoer/datasets/NSD"
+DEFAULT_NSD_ROOT = Path(os.environ.get("MINDSET_NSD_ROOT", _PLATFORM_NSD_ROOT))
 DEFAULT_ANNOTATION_DIR = DEFAULT_NSD_ROOT / "annotations"
 DEFAULT_STIM_INFO_PATH = DEFAULT_ANNOTATION_DIR / "nsd_stim_info_merged.csv"
 DEFAULT_BETAS_PATH = DEFAULT_NSD_ROOT / "subj01" / "betas_float16.npy"
