@@ -12,10 +12,12 @@ from typing import Any
 
 import numpy as np
 import torch
+from diffusers import AutoencoderKL
 from diffusers.models.autoencoders.vae import Decoder
 from PIL import Image, ImageDraw
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 from torchvision.models import (
     ConvNeXt_Base_Weights,
     ConvNeXt_Small_Weights,
@@ -39,6 +41,7 @@ from dataloader import (  # noqa: E402
     DEFAULT_STIM_INFO_PATH,
     DEFAULT_STIMULUS_H5_PATH,
     DEFAULT_SUBJECT,
+    collate_nsd_concepts,
     create_dataloaders,
     str2bool,
 )
@@ -58,6 +61,10 @@ class Low1DConfig:
     aux_dim: int = 768
     output_channels: int = 3
     output_size: int = 64
+    target_mode: str = "rgb"
+    input_rank: int = 0
+    latent_channels: int = 4
+    latent_size: int = 32
 
 
 @dataclass
@@ -70,6 +77,10 @@ class LowLossConfig:
     soft_clip_temp: float = 0.005
     aux_cont_temp: float = 0.2
     aux_cont_max_tokens: int = 4096
+    latent_l1_weight: float = 1.0
+    decoded_l1_weight: float = 0.0
+    decoded_edge_weight: float = 0.0
+    decoded_loss_samples: int = 8
 
 
 def dataclass_from_payload(cls: type, payload: dict[str, Any]) -> Any:
@@ -81,19 +92,40 @@ class Low1DModel(nn.Module):
     def __init__(self, config: Low1DConfig) -> None:
         super().__init__()
         self.config = config
-        if config.output_size < config.spatial_seed_size or config.output_size % config.spatial_seed_size != 0:
+        if config.target_mode not in {"rgb", "vae"}:
+            raise ValueError(f"Unsupported target_mode={config.target_mode!r}.")
+        if config.target_mode == "rgb" and (
+            config.output_size < config.spatial_seed_size or config.output_size % config.spatial_seed_size != 0
+        ):
             raise ValueError(
                 "output_size must be a multiple of spatial_seed_size: "
                 f"output_size={config.output_size}, spatial_seed_size={config.spatial_seed_size}"
             )
-        self.embedder = nn.Sequential(
-            AdapterLayer(config.in_dim, config.adapter_bottleneck),
-            nn.Linear(config.in_dim, config.hidden_dim),
-            nn.LayerNorm(config.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-        )
+        if config.input_rank > 0:
+            self.embedder = nn.Sequential(
+                nn.Linear(config.in_dim, config.input_rank, bias=False),
+                nn.LayerNorm(config.input_rank),
+                nn.GELU(),
+                nn.Linear(config.input_rank, config.hidden_dim),
+                nn.LayerNorm(config.hidden_dim),
+                nn.GELU(),
+                nn.Dropout(config.dropout),
+            )
+        else:
+            self.embedder = nn.Sequential(
+                AdapterLayer(config.in_dim, config.adapter_bottleneck),
+                nn.Linear(config.in_dim, config.hidden_dim),
+                nn.LayerNorm(config.hidden_dim),
+                nn.GELU(),
+                nn.Dropout(config.dropout),
+            )
         self.translator = ResMLP(config.hidden_dim, config.n_blocks, config.dropout)
+        if config.target_mode == "vae":
+            self.latent_head = nn.Sequential(
+                nn.LayerNorm(config.hidden_dim),
+                nn.Linear(config.hidden_dim, config.latent_channels * config.latent_size * config.latent_size),
+            )
+            return
         seed_dim = config.spatial_channels * config.spatial_seed_size * config.spatial_seed_size
         self.low_seed = nn.Sequential(
             nn.LayerNorm(config.hidden_dim),
@@ -121,6 +153,14 @@ class Low1DModel(nn.Module):
         if fmri.ndim != 2:
             raise ValueError(f"Expected 1D fMRI tensor [B,V], got {tuple(fmri.shape)}.")
         hidden = self.translator(self.embedder(fmri))
+        if self.config.target_mode == "vae":
+            latent = self.latent_head(hidden).view(
+                fmri.shape[0],
+                self.config.latent_channels,
+                self.config.latent_size,
+                self.config.latent_size,
+            )
+            return {"vae_latent": latent}
         seed = self.low_seed(hidden).view(
             fmri.shape[0],
             self.config.spatial_channels,
@@ -139,6 +179,91 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def compute_train_voxel_stats(dataset: Any, chunk_size: int = 512) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = [int(dataset.records[idx]["beta_row"]) for idx in dataset.indices]
+    total = np.zeros(dataset.betas.shape[1], dtype=np.float64)
+    total_sq = np.zeros(dataset.betas.shape[1], dtype=np.float64)
+    count = 0
+    for start in range(0, len(rows), chunk_size):
+        chunk = np.asarray(dataset.betas[rows[start : start + chunk_size]], dtype=np.float32)
+        total += chunk.sum(axis=0, dtype=np.float64)
+        total_sq += np.square(chunk, dtype=np.float32).sum(axis=0, dtype=np.float64)
+        count += int(chunk.shape[0])
+    mean = total / max(count, 1)
+    variance = np.maximum(total_sq / max(count, 1) - np.square(mean), 1e-6)
+    return torch.from_numpy(mean.astype(np.float32)), torch.from_numpy(np.sqrt(variance).astype(np.float32))
+
+
+class RepeatAveragedDataset(Dataset):
+    def __init__(
+        self,
+        dataset: Any,
+        voxel_mean: torch.Tensor,
+        voxel_std: torch.Tensor,
+        random_subsets: bool,
+    ) -> None:
+        self.dataset = dataset
+        self.voxel_mean = voxel_mean
+        self.voxel_std = voxel_std
+        self.random_subsets = random_subsets
+        grouped: dict[int, list[int]] = {}
+        for logical_index, record_index in enumerate(dataset.indices):
+            nsd_id = int(dataset.records[record_index]["nsd_id"])
+            grouped.setdefault(nsd_id, []).append(logical_index)
+        self.groups = list(grouped.values())
+
+    def __len__(self) -> int:
+        return len(self.groups)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        group = self.groups[index]
+        selected = group
+        if self.random_subsets and len(group) > 1:
+            selected = random.sample(group, k=random.randint(1, len(group)))
+        item = self.dataset[group[0]]
+        volumes = []
+        for logical_index in selected:
+            record_index = self.dataset.indices[logical_index]
+            beta_row = int(self.dataset.records[record_index]["beta_row"])
+            volumes.append(torch.from_numpy(self.dataset._load_fmri(beta_row).copy()).float())
+        fmri = torch.stack(volumes).mean(dim=0)
+        item["fmri"] = (fmri - self.voxel_mean) / self.voxel_std
+        item["metadata"] = {
+            **item["metadata"],
+            "repeat_count": len(selected),
+            "available_repeats": len(group),
+            "group_index": index,
+        }
+        return item
+
+
+def make_repeat_averaged_loaders(
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    test_loader: DataLoader,
+    batch_size: int,
+    num_workers: int,
+) -> tuple[DataLoader, DataLoader, DataLoader, torch.Tensor, torch.Tensor]:
+    mean, std = compute_train_voxel_stats(train_loader.dataset)
+    datasets = [
+        RepeatAveragedDataset(train_loader.dataset, mean, std, random_subsets=True),
+        RepeatAveragedDataset(val_loader.dataset, mean, std, random_subsets=False),
+        RepeatAveragedDataset(test_loader.dataset, mean, std, random_subsets=False),
+    ]
+    loaders = [
+        DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=index == 0,
+            num_workers=num_workers,
+            collate_fn=collate_nsd_concepts,
+            pin_memory=torch.cuda.is_available(),
+        )
+        for index, dataset in enumerate(datasets)
+    ]
+    return loaders[0], loaders[1], loaders[2], mean, std
 
 
 def move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
@@ -202,6 +327,61 @@ def make_rgb_target(batch: dict[str, Any], device: torch.device, output_size: in
     if images.shape[-1] != output_size or images.shape[-2] != output_size:
         images = F.interpolate(images, size=(output_size, output_size), mode="area")
     return images.clamp(0, 1)
+
+
+def load_frozen_vae(model_root: Path, device: torch.device) -> AutoencoderKL:
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+    vae = AutoencoderKL.from_pretrained(
+        model_root / "madebyollin__sdxl-vae-fp16-fix",
+        torch_dtype=dtype,
+        local_files_only=True,
+    ).to(device)
+    vae.requires_grad_(False)
+    vae.eval()
+    return vae
+
+
+def decode_vae_latents(latents: torch.Tensor, vae: AutoencoderKL) -> torch.Tensor:
+    dtype = next(vae.parameters()).dtype
+    scaling_factor = float(getattr(vae.config, "scaling_factor", 1.0))
+    decoded = vae.decode(latents.to(dtype=dtype) / scaling_factor).sample
+    return (decoded.float() * 0.5 + 0.5).clamp(0, 1)
+
+
+def image_edge_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+    target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
+    pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+    target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+    return 0.5 * (F.l1_loss(pred_dx, target_dx) + F.l1_loss(pred_dy, target_dy))
+
+
+def compute_image_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+    pred = pred.float().clamp(0, 1)
+    target = target.float().clamp(0, 1)
+    if pred.shape[-2:] != target.shape[-2:]:
+        pred = F.interpolate(pred, size=target.shape[-2:], mode="bilinear", align_corners=False)
+    pred_flat = pred.flatten(1)
+    target_flat = target.flatten(1)
+    pred_centered = pred_flat - pred_flat.mean(dim=1, keepdim=True)
+    target_centered = target_flat - target_flat.mean(dim=1, keepdim=True)
+    pixel_corr = (
+        (pred_centered * target_centered).sum(dim=1)
+        / (pred_centered.norm(dim=1) * target_centered.norm(dim=1)).clamp_min(1e-8)
+    ).mean()
+    mse = F.mse_loss(pred, target)
+    psnr = -10.0 * torch.log10(mse.clamp_min(1e-8))
+    mu_x = pred.mean(dim=(2, 3))
+    mu_y = target.mean(dim=(2, 3))
+    var_x = pred.var(dim=(2, 3), unbiased=False)
+    var_y = target.var(dim=(2, 3), unbiased=False)
+    covariance = ((pred - mu_x[:, :, None, None]) * (target - mu_y[:, :, None, None])).mean(dim=(2, 3))
+    c1, c2 = 0.01**2, 0.03**2
+    ssim = (
+        ((2 * mu_x * mu_y + c1) * (2 * covariance + c2))
+        / ((mu_x.square() + mu_y.square() + c1) * (var_x + var_y + c2))
+    ).mean()
+    return {"pixcorr": pixel_corr.detach(), "psnr": psnr.detach(), "ssim": ssim.detach()}
 
 
 def augment_images(images: torch.Tensor) -> torch.Tensor:
@@ -268,7 +448,47 @@ def compute_low_loss(
     batch: dict[str, Any],
     cfg: LowLossConfig,
     convnext_teacher: FrozenConvNeXtTeacher | None,
+    vae: AutoencoderKL | None,
 ) -> dict[str, torch.Tensor]:
+    if "vae_latent" in outputs:
+        pred = outputs["vae_latent"]
+        target = batch["image_vae_latents"].to(device=pred.device, dtype=pred.dtype)
+        latent_l1 = F.smooth_l1_loss(pred, target)
+        decoded_l1 = pred.new_tensor(0.0)
+        decoded_edge = pred.new_tensor(0.0)
+        if cfg.decoded_l1_weight > 0 or cfg.decoded_edge_weight > 0:
+            if vae is None:
+                raise RuntimeError("Decoded image losses require a frozen VAE.")
+            n = min(max(cfg.decoded_loss_samples, 1), pred.shape[0])
+            decoded = decode_vae_latents(pred[:n], vae)
+            image_target = make_rgb_target(batch, pred.device, output_size=decoded.shape[-1])[:n]
+            decoded_l1 = F.l1_loss(decoded, image_target)
+            decoded_edge = image_edge_loss(decoded, image_target)
+        loss_latent_l1 = cfg.latent_l1_weight * latent_l1
+        loss_decoded_l1 = cfg.decoded_l1_weight * decoded_l1
+        loss_decoded_edge = cfg.decoded_edge_weight * decoded_edge
+        loss = loss_latent_l1 + loss_decoded_l1 + loss_decoded_edge
+        zero = pred.new_tensor(0.0)
+        return {
+            "loss": loss,
+            "latent_l1": latent_l1.detach(),
+            "decoded_l1": decoded_l1.detach(),
+            "decoded_edge": decoded_edge.detach(),
+            "loss_latent_l1": loss_latent_l1.detach(),
+            "loss_decoded_l1": loss_decoded_l1.detach(),
+            "loss_decoded_edge": loss_decoded_edge.detach(),
+            "low_l1": zero,
+            "low_mse": zero,
+            "aux_cont": zero,
+            "image_mse": zero,
+            "image_soft_clip": zero,
+            "loss_low_l1": zero,
+            "loss_low_mse": zero,
+            "loss_aux_cont": zero,
+            "loss_image_mse": zero,
+            "loss_image_soft_clip": zero,
+        }
+
     pred = outputs["low_level_rgb"]
     target = make_rgb_target(batch, pred.device, output_size=pred.shape[-1]).to(dtype=pred.dtype)
     if tuple(pred.shape) != tuple(target.shape):
@@ -311,6 +531,12 @@ def compute_low_loss(
         "loss_aux_cont": loss_aux_cont.detach(),
         "loss_image_mse": loss_image_mse.detach(),
         "loss_image_soft_clip": loss_image_soft_clip.detach(),
+        "latent_l1": pred.new_tensor(0.0),
+        "decoded_l1": pred.new_tensor(0.0),
+        "decoded_edge": pred.new_tensor(0.0),
+        "loss_latent_l1": pred.new_tensor(0.0),
+        "loss_decoded_l1": pred.new_tensor(0.0),
+        "loss_decoded_edge": pred.new_tensor(0.0),
     }
 
 
@@ -337,11 +563,16 @@ def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
     return Image.fromarray(array, mode="RGB")
 
 
-def save_original_pred_grid(original: Image.Image, pred: Image.Image, output_path: Path) -> None:
+def save_original_pred_grid(
+    original: Image.Image,
+    pred: Image.Image,
+    output_path: Path,
+    prediction_label: str = "Predicted",
+) -> None:
     panel_size = 320
     label_h = 44
     gap = 12
-    columns = [("Original", original), ("Predicted RGB64", pred)]
+    columns = [("Original", original), (prediction_label, pred)]
     canvas = Image.new("RGB", (panel_size * 2 + gap, panel_size + label_h), "white")
     draw = ImageDraw.Draw(canvas)
     x = 0
@@ -360,6 +591,7 @@ def train_one_epoch(
     device: torch.device,
     loss_cfg: LowLossConfig,
     convnext_teacher: FrozenConvNeXtTeacher | None,
+    vae: AutoencoderKL | None,
     enable_pool: bool,
     pool_num: int,
     pool_type: str,
@@ -375,7 +607,7 @@ def train_one_epoch(
             pool_type=pool_type,
         )
         outputs = model(fmri)
-        losses = compute_low_loss(outputs, batch, loss_cfg, convnext_teacher)
+        losses = compute_low_loss(outputs, batch, loss_cfg, convnext_teacher, vae)
         optimizer.zero_grad(set_to_none=True)
         losses["loss"].backward()
         optimizer.step()
@@ -392,6 +624,7 @@ def evaluate_model(
     device: torch.device,
     loss_cfg: LowLossConfig,
     convnext_teacher: FrozenConvNeXtTeacher | None,
+    vae: AutoencoderKL | None,
     enable_pool: bool,
     pool_num: int,
     pool_type: str,
@@ -407,7 +640,15 @@ def evaluate_model(
             pool_type=pool_type,
         )
         outputs = model(fmri)
-        losses = compute_low_loss(outputs, batch, loss_cfg, convnext_teacher)
+        losses = compute_low_loss(outputs, batch, loss_cfg, convnext_teacher, vae)
+        if "low_level_rgb" in outputs:
+            predicted_image = outputs["low_level_rgb"]
+        else:
+            if vae is None:
+                raise RuntimeError("VAE evaluation requires a frozen decoder.")
+            predicted_image = decode_vae_latents(outputs["vae_latent"], vae)
+        image_target = batch_images_to_float(batch["image"], device)
+        losses.update(compute_image_metrics(predicted_image, image_target))
         n = int(fmri.shape[0])
         update_meter(total, losses, n)
         count += n
@@ -424,6 +665,7 @@ def save_eval_reconstruction(
     pool_num: int,
     pool_type: str,
     image_size: int,
+    vae: AutoencoderKL | None,
 ) -> None:
     model.eval()
     batch = next(iter(loader))
@@ -433,12 +675,14 @@ def save_eval_reconstruction(
         pool_num=pool_num,
         pool_type=pool_type,
     )
-    pred_rgb = model(fmri)["low_level_rgb"]
+    outputs = model(fmri)
+    pred_rgb = outputs["low_level_rgb"] if "low_level_rgb" in outputs else decode_vae_latents(outputs["vae_latent"], vae)
     original = batch_image_to_pil(batch)
     pred = tensor_to_pil(pred_rgb[0].cpu())
     if pred.size != (image_size, image_size):
         pred = pred.resize((image_size, image_size), Image.Resampling.BICUBIC)
-    save_original_pred_grid(original, pred, output_path)
+    label = "Predicted RGB64" if "low_level_rgb" in outputs else "Decoded VAE latent"
+    save_original_pred_grid(original, pred, output_path, prediction_label=label)
 
 
 @torch.no_grad()
@@ -452,6 +696,7 @@ def save_fixed_split_reconstructions(
     pool_type: str,
     image_size: int,
     sample_count: int,
+    vae: AutoencoderKL | None,
 ) -> dict[str, list[dict[str, Any]]]:
     model.eval()
     manifest: dict[str, list[dict[str, Any]]] = {}
@@ -467,7 +712,12 @@ def save_fixed_split_reconstructions(
                 pool_num=pool_num,
                 pool_type=pool_type,
             )
-            pred_rgb = model(fmri)["low_level_rgb"][0]
+            outputs = model(fmri)
+            pred_rgb = (
+                outputs["low_level_rgb"]
+                if "low_level_rgb" in outputs
+                else decode_vae_latents(outputs["vae_latent"], vae)
+            )[0]
             original_array = item["image"].numpy()
             if original_array.ndim == 3 and original_array.shape[0] == 3:
                 original_array = np.transpose(original_array, (1, 2, 0))
@@ -481,7 +731,8 @@ def save_fixed_split_reconstructions(
             split_dir = run_dir / "samples" / split
             split_dir.mkdir(parents=True, exist_ok=True)
             comparison_path = split_dir / f"{stem}_comparison.png"
-            save_original_pred_grid(original, reconstruction, comparison_path)
+            label = "Predicted RGB64" if "low_level_rgb" in outputs else "Decoded VAE latent"
+            save_original_pred_grid(original, reconstruction, comparison_path, prediction_label=label)
             manifest[split].append(
                 {
                     "dataset_index": int(dataset_index),
@@ -538,6 +789,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pool-num", type=int, default=8192)
     parser.add_argument("--pool-type", choices=["max", "avg"], default="max")
     parser.add_argument("--normalize", choices=["none", "volume"], default="volume")
+    parser.add_argument("--average-repeats", type=str2bool, default=False)
+    parser.add_argument("--voxel-normalize", type=str2bool, default=False)
+    parser.add_argument("--target-mode", choices=["rgb", "vae"], default="rgb")
+    parser.add_argument("--input-rank", type=int, default=0)
     parser.add_argument("--low-l1-weight", type=float, default=1.0)
     parser.add_argument("--low-mse-weight", type=float, default=0.1)
     parser.add_argument("--aux-cont-weight", type=float, default=0.1)
@@ -546,9 +801,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--soft-clip-temp", type=float, default=0.005)
     parser.add_argument("--aux-cont-temp", type=float, default=0.2)
     parser.add_argument("--aux-cont-max-tokens", type=int, default=4096)
+    parser.add_argument("--latent-l1-weight", type=float, default=1.0)
+    parser.add_argument("--decoded-l1-weight", type=float, default=0.0)
+    parser.add_argument("--decoded-edge-weight", type=float, default=0.0)
+    parser.add_argument("--decoded-loss-samples", type=int, default=8)
     parser.add_argument("--recon-image-size", type=int, default=256)
     parser.add_argument("--save-recon", type=str2bool, default=True)
     parser.add_argument("--fixed-samples-per-split", type=int, default=5)
+    parser.add_argument("--delete-checkpoints-after-run", type=str2bool, default=False)
     return parser.parse_args()
 
 
@@ -562,6 +822,7 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.jsonl"
 
+    base_normalize = "none" if args.voxel_normalize else args.normalize
     train_loader, val_loader, test_loader = create_dataloaders(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -575,32 +836,34 @@ def main() -> None:
         fmri_format="1d",
         subject=args.subject,
         seed=args.seed,
-        normalize=args.normalize,
-        include_vae_latents=False,
+        normalize=base_normalize,
+        include_vae_latents=args.target_mode == "vae",
         include_raw=True,
     )
-    _, val_recon_loader, _ = create_dataloaders(
+    voxel_mean = voxel_std = None
+    if args.voxel_normalize or args.average_repeats:
+        train_loader, val_loader, test_loader, voxel_mean, voxel_std = make_repeat_averaged_loaders(
+            train_loader,
+            val_loader,
+            test_loader,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+    val_recon_loader = DataLoader(
+        val_loader.dataset,
         batch_size=1,
+        shuffle=False,
         num_workers=0,
-        annotation_dir=args.annotation_dir,
-        stim_info_path=args.stim_info_path,
-        betas_1d_path=args.betas_1d_path,
-        caption_embeddings_path=args.caption_embeddings_path,
-        image_embeddings_path=args.image_embeddings_path,
-        image_vae_latents_path=args.image_vae_latents_path,
-        stimulus_h5_path=args.stimulus_h5_path,
-        fmri_format="1d",
-        subject=args.subject,
-        seed=args.seed,
-        normalize=args.normalize,
-        include_vae_latents=False,
-        include_raw=True,
-        shuffle_train=False,
+        collate_fn=collate_nsd_concepts,
     )
     first_batch = next(iter(train_loader))
     raw_in_dim = int(first_batch["fmri"].shape[-1])
     model_in_dim = args.pool_num if args.enable_pool else raw_in_dim
-    output_shape = (3, int(args.output_size), int(args.output_size))
+    output_shape = (
+        (4, 32, 32)
+        if args.target_mode == "vae"
+        else (3, int(args.output_size), int(args.output_size))
+    )
     image_embedding_dim = int(first_batch["image_embeddings"].shape[-1])
 
     resume_checkpoint: dict[str, Any] | None = None
@@ -621,7 +884,13 @@ def main() -> None:
                 f"Resume checkpoint expects image_embedding_dim={model_cfg.image_embedding_dim}, "
                 f"but current labels use {image_embedding_dim}."
             )
-        if model_cfg.output_channels != output_shape[0] or model_cfg.output_size != output_shape[1]:
+        if model_cfg.target_mode != args.target_mode:
+            raise ValueError(
+                f"Resume checkpoint target_mode={model_cfg.target_mode}, current={args.target_mode}."
+            )
+        if args.target_mode == "rgb" and (
+            model_cfg.output_channels != output_shape[0] or model_cfg.output_size != output_shape[1]
+        ):
             raise ValueError(
                 "Resume checkpoint output shape does not match current RGB targets: "
                 f"checkpoint=({model_cfg.output_channels}, {model_cfg.output_size}, {model_cfg.output_size}), "
@@ -640,6 +909,10 @@ def main() -> None:
             aux_dim=args.aux_dim,
             output_channels=output_shape[0],
             output_size=output_shape[1],
+            target_mode=args.target_mode,
+            input_rank=args.input_rank,
+            latent_channels=4,
+            latent_size=32,
         )
     loss_cfg = LowLossConfig(
         low_l1_weight=args.low_l1_weight,
@@ -650,6 +923,10 @@ def main() -> None:
         soft_clip_temp=args.soft_clip_temp,
         aux_cont_temp=args.aux_cont_temp,
         aux_cont_max_tokens=args.aux_cont_max_tokens,
+        latent_l1_weight=args.latent_l1_weight,
+        decoded_l1_weight=args.decoded_l1_weight,
+        decoded_edge_weight=args.decoded_edge_weight,
+        decoded_loss_samples=args.decoded_loss_samples,
     )
     model = Low1DModel(model_cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -679,7 +956,16 @@ def main() -> None:
         "resume_checkpoint": None if resume_path is None else str(resume_path),
         "resume_start_epoch": resume_start_epoch,
         "train_additional_epochs": args.epochs,
+        "train_samples": len(train_loader.dataset),
+        "val_samples": len(val_loader.dataset),
+        "test_samples": len(test_loader.dataset),
     }
+    if voxel_mean is not None and voxel_std is not None:
+        np.savez_compressed(
+            run_dir / "voxel_stats.npz",
+            mean=voxel_mean.numpy(),
+            std=voxel_std.numpy(),
+        )
     with (run_dir / "config.json").open("w", encoding="utf-8") as f:
         json.dump(config_payload, f, ensure_ascii=False, indent=2)
     print(f"run_dir={run_dir}")
@@ -700,6 +986,10 @@ def main() -> None:
                 f"feature dim={convnext_teacher.out_dim}. Set --aux-dim {convnext_teacher.out_dim}."
             )
 
+    vae = None
+    if args.target_mode == "vae":
+        vae = load_frozen_vae(args.model_root, device)
+
     best_loss = float("inf")
     best_epoch = -1
     final_epoch = resume_start_epoch + args.epochs
@@ -712,6 +1002,7 @@ def main() -> None:
             device,
             loss_cfg,
             convnext_teacher,
+            vae,
             enable_pool=args.enable_pool,
             pool_num=args.pool_num,
             pool_type=args.pool_type,
@@ -725,6 +1016,9 @@ def main() -> None:
             f"aux_cont*w={train_losses['loss_aux_cont']:.6f} "
             f"img_mse*w={train_losses['loss_image_mse']:.6f} "
             f"img_sc*w={train_losses['loss_image_soft_clip']:.6f} "
+            f"latent_l1*w={train_losses['loss_latent_l1']:.6f} "
+            f"decoded_l1*w={train_losses['loss_decoded_l1']:.6f} "
+            f"edge*w={train_losses['loss_decoded_edge']:.6f} "
             f"time={train_time:.1f}s"
         )
 
@@ -737,6 +1031,7 @@ def main() -> None:
                 device,
                 loss_cfg,
                 convnext_teacher,
+                vae,
                 enable_pool=args.enable_pool,
                 pool_num=args.pool_num,
                 pool_type=args.pool_type,
@@ -765,6 +1060,12 @@ def main() -> None:
                 f" val_aux_cont*w={val_losses['loss_aux_cont']:.6f}"
                 f" val_img_mse*w={val_losses['loss_image_mse']:.6f}"
                 f" val_img_sc*w={val_losses['loss_image_soft_clip']:.6f}"
+                f" val_latent_l1*w={val_losses['loss_latent_l1']:.6f}"
+                f" val_decoded_l1*w={val_losses['loss_decoded_l1']:.6f}"
+                f" val_edge*w={val_losses['loss_decoded_edge']:.6f}"
+                f" pixcorr={val_losses['pixcorr']:.4f}"
+                f" ssim={val_losses['ssim']:.4f}"
+                f" psnr={val_losses['psnr']:.2f}"
                 f" best={best_loss:.6f}@{best_epoch}"
                 f" eval_time={eval_time:.1f}s"
             )
@@ -779,6 +1080,7 @@ def main() -> None:
                     pool_num=args.pool_num,
                     pool_type=args.pool_type,
                     image_size=args.recon_image_size,
+                    vae=vae,
                 )
                 payload["recon_path"] = str(recon_path)
                 message += f" recon={recon_path.name}"
@@ -806,6 +1108,7 @@ def main() -> None:
         device,
         loss_cfg,
         convnext_teacher,
+        vae,
         enable_pool=args.enable_pool,
         pool_num=args.pool_num,
         pool_type=args.pool_type,
@@ -823,6 +1126,7 @@ def main() -> None:
             pool_type=args.pool_type,
             image_size=args.recon_image_size,
             sample_count=args.fixed_samples_per_split,
+            vae=vae,
         )
         print(
             "saved fixed reconstructions "
@@ -835,7 +1139,16 @@ def main() -> None:
         f"test_aux_cont={test_losses['aux_cont']:.6f} "
         f"test_image_mse={test_losses['image_mse']:.6f} "
         f"test_image_soft_clip={test_losses['image_soft_clip']:.6f}"
+        f" test_latent_l1={test_losses['latent_l1']:.6f}"
+        f" test_decoded_l1={test_losses['decoded_l1']:.6f}"
+        f" test_decoded_edge={test_losses['decoded_edge']:.6f}"
     )
+    if args.delete_checkpoints_after_run:
+        deleted = []
+        for checkpoint_path in run_dir.glob("*.pt"):
+            checkpoint_path.unlink()
+            deleted.append(checkpoint_path.name)
+        print(f"deleted checkpoints after evaluation: {deleted}")
     print(f"saved outputs to {run_dir}")
 
 
