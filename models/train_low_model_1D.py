@@ -5,7 +5,7 @@ import json
 import random
 import sys
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -809,6 +809,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoded-l1-weight", type=float, default=0.0)
     parser.add_argument("--decoded-edge-weight", type=float, default=0.0)
     parser.add_argument("--decoded-loss-samples", type=int, default=8)
+    parser.add_argument(
+        "--decoded-loss-start-epoch",
+        type=int,
+        default=1,
+        help="First epoch that applies decoded image losses; earlier epochs use latent loss only.",
+    )
+    parser.add_argument(
+        "--best-metric",
+        choices=["loss", "pixcorr", "ssim", "visual"],
+        default="loss",
+        help="Validation criterion used to select the checkpoint. visual averages PixCorr and SSIM.",
+    )
     parser.add_argument("--recon-image-size", type=int, default=256)
     parser.add_argument("--save-recon", type=str2bool, default=True)
     parser.add_argument("--fixed-samples-per-split", type=int, default=5)
@@ -999,16 +1011,21 @@ def main() -> None:
         )
 
     best_loss = float("inf")
+    best_score = float("inf") if args.best_metric == "loss" else -float("inf")
     best_epoch = -1
     final_epoch = resume_start_epoch + args.epochs
     for epoch in range(resume_start_epoch + 1, final_epoch + 1):
+        decoded_loss_active = epoch >= args.decoded_loss_start_epoch
+        epoch_loss_cfg = loss_cfg
+        if not decoded_loss_active:
+            epoch_loss_cfg = replace(loss_cfg, decoded_l1_weight=0.0, decoded_edge_weight=0.0)
         start = time.perf_counter()
         train_losses = train_one_epoch(
             model,
             train_loader,
             optimizer,
             device,
-            loss_cfg,
+            epoch_loss_cfg,
             convnext_teacher,
             vae,
             enable_pool=args.enable_pool,
@@ -1037,7 +1054,7 @@ def main() -> None:
                 model,
                 val_loader,
                 device,
-                loss_cfg,
+                epoch_loss_cfg,
                 convnext_teacher,
                 vae,
                 enable_pool=args.enable_pool,
@@ -1047,8 +1064,18 @@ def main() -> None:
             eval_time = time.perf_counter() - eval_start
             payload["val"] = val_losses
             payload["val_time_sec"] = eval_time
-            if val_losses["loss"] < best_loss:
-                best_loss = val_losses["loss"]
+            best_loss = min(best_loss, val_losses["loss"])
+            if args.best_metric == "loss":
+                current_score = val_losses["loss"]
+                is_best = current_score < best_score
+            elif args.best_metric == "visual":
+                current_score = 0.5 * (val_losses["pixcorr"] + val_losses["ssim"])
+                is_best = current_score > best_score
+            else:
+                current_score = val_losses[args.best_metric]
+                is_best = current_score > best_score
+            if is_best:
+                best_score = current_score
                 best_epoch = epoch
                 torch.save(
                     {
@@ -1057,6 +1084,8 @@ def main() -> None:
                         "model_config": asdict(model_cfg),
                         "epoch": epoch,
                         "best_loss": best_loss,
+                        "best_metric": args.best_metric,
+                        "best_score": best_score,
                         "best_epoch": best_epoch,
                     },
                     run_dir / "best_low_model.pt",
@@ -1074,7 +1103,7 @@ def main() -> None:
                 f" pixcorr={val_losses['pixcorr']:.4f}"
                 f" ssim={val_losses['ssim']:.4f}"
                 f" psnr={val_losses['psnr']:.2f}"
-                f" best={best_loss:.6f}@{best_epoch}"
+                f" best_{args.best_metric}={best_score:.6f}@{best_epoch}"
                 f" eval_time={eval_time:.1f}s"
             )
             if args.save_recon:
@@ -1102,6 +1131,8 @@ def main() -> None:
             "model_config": asdict(model_cfg),
             "epoch": final_epoch,
             "best_loss": best_loss,
+            "best_metric": args.best_metric,
+            "best_score": best_score,
             "best_epoch": best_epoch,
         },
         run_dir / "last_low_model.pt",
