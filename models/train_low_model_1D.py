@@ -329,8 +329,12 @@ def make_rgb_target(batch: dict[str, Any], device: torch.device, output_size: in
     return images.clamp(0, 1)
 
 
-def load_frozen_vae(model_root: Path, device: torch.device) -> AutoencoderKL:
-    dtype = torch.float16 if device.type == "cuda" else torch.float32
+def load_frozen_vae(
+    model_root: Path,
+    device: torch.device,
+    force_float32: bool = False,
+) -> AutoencoderKL:
+    dtype = torch.float32 if force_float32 or device.type != "cuda" else torch.float16
     vae = AutoencoderKL.from_pretrained(
         model_root / "madebyollin__sdxl-vae-fp16-fix",
         torch_dtype=dtype,
@@ -988,7 +992,11 @@ def main() -> None:
 
     vae = None
     if args.target_mode == "vae":
-        vae = load_frozen_vae(args.model_root, device)
+        vae = load_frozen_vae(
+            args.model_root,
+            device,
+            force_float32=args.decoded_l1_weight > 0 or args.decoded_edge_weight > 0,
+        )
 
     best_loss = float("inf")
     best_epoch = -1
