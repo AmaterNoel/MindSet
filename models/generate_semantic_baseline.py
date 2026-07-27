@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import StableDiffusionXLPipeline
+from diffusers import AutoencoderKL, StableDiffusionXLPipeline
 from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,7 +27,12 @@ from dataloader import (  # noqa: E402
     DEFAULT_STIMULUS_H5_PATH,
     create_dataloaders,
 )
-from models.train_base_model_1D import Mind1D, Mind1DConfig, make_repeat_averaged_loaders  # noqa: E402
+from models.train_base_model_1D import (  # noqa: E402
+    Mind1D,
+    Mind1DConfig,
+    make_repeat_averaged_loaders,
+    maybe_pool_fmri,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -136,6 +141,12 @@ def main() -> None:
     with torch.no_grad():
         for split, samples in split_samples.items():
             fmri = torch.stack([item["fmri"] for item in samples]).to(device)
+            fmri = maybe_pool_fmri(
+                fmri,
+                enable_pool=fmri.shape[-1] != model.config.in_dim,
+                pool_num=model.config.in_dim,
+                pool_type="max",
+            )
             output = model(fmri)["image_embedding"].float()
             target = F.normalize(torch.stack([item["target"] for item in samples]).to(device).float(), dim=-1)
             predicted[split] = list(output.cpu())
@@ -148,8 +159,15 @@ def main() -> None:
     del model
     torch.cuda.empty_cache()
 
+    vae = AutoencoderKL.from_pretrained(
+        args.model_root / "madebyollin__sdxl-vae-fp16-fix",
+        torch_dtype=dtype,
+        use_safetensors=True,
+        local_files_only=True,
+    )
     pipe = StableDiffusionXLPipeline.from_pretrained(
         args.model_root / "stabilityai__stable-diffusion-xl-base-1.0",
+        vae=vae,
         torch_dtype=dtype,
         variant="fp16" if dtype == torch.float16 else None,
         use_safetensors=True,
