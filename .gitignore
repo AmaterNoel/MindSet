@@ -7,6 +7,8 @@ output/
 output_smoke/
 dashboard/
 dashboard_cache/
+dashboard.stdout.log
+dashboard.stderr.log
 
 # Dataset/model binaries should stay outside git.
 *.pt

@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -28,6 +29,7 @@ from dataloader import (  # noqa: E402
     DEFAULT_STIM_INFO_PATH,
     DEFAULT_STIMULUS_H5_PATH,
     DEFAULT_SUBJECT,
+    collate_nsd_concepts,
     create_dataloaders,
     str2bool,
 )
@@ -146,6 +148,84 @@ def maybe_pool_fmri(voxels: torch.Tensor, enable_pool: bool, pool_num: int, pool
     if voxels.ndim != 2:
         raise ValueError(f"Expected fmri tensor shape [B,V], got {tuple(voxels.shape)}.")
     return pool_voxels(voxels, pool_num=pool_num, pool_type=pool_type)
+
+
+def compute_train_voxel_stats(dataset: Any, chunk_size: int = 512) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = [int(dataset.records[idx]["beta_row"]) for idx in dataset.indices]
+    total = np.zeros(dataset.betas.shape[1], dtype=np.float64)
+    total_sq = np.zeros(dataset.betas.shape[1], dtype=np.float64)
+    count = 0
+    for start in range(0, len(rows), chunk_size):
+        chunk = np.asarray(dataset.betas[rows[start : start + chunk_size]], dtype=np.float32)
+        total += chunk.sum(axis=0, dtype=np.float64)
+        total_sq += np.square(chunk, dtype=np.float32).sum(axis=0, dtype=np.float64)
+        count += int(chunk.shape[0])
+    mean = total / max(count, 1)
+    variance = np.maximum(total_sq / max(count, 1) - np.square(mean), 1e-6)
+    return torch.from_numpy(mean.astype(np.float32)), torch.from_numpy(np.sqrt(variance).astype(np.float32))
+
+
+class RepeatAveragedDataset(Dataset):
+    def __init__(self, dataset: Any, voxel_mean: torch.Tensor, voxel_std: torch.Tensor, random_subsets: bool) -> None:
+        self.dataset = dataset
+        self.voxel_mean = voxel_mean
+        self.voxel_std = voxel_std
+        self.random_subsets = random_subsets
+        grouped: dict[int, list[int]] = {}
+        for logical_index, record_index in enumerate(dataset.indices):
+            nsd_id = int(dataset.records[record_index]["nsd_id"])
+            grouped.setdefault(nsd_id, []).append(logical_index)
+        self.groups = list(grouped.values())
+
+    def __len__(self) -> int:
+        return len(self.groups)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        group = self.groups[index]
+        selected = group
+        if self.random_subsets and len(group) > 1:
+            selected = random.sample(group, k=random.randint(1, len(group)))
+        item = self.dataset[group[0]]
+        volumes = []
+        for logical_index in selected:
+            record_index = self.dataset.indices[logical_index]
+            beta_row = int(self.dataset.records[record_index]["beta_row"])
+            volumes.append(torch.from_numpy(self.dataset._load_fmri(beta_row).copy()).float())
+        item["fmri"] = (torch.stack(volumes).mean(dim=0) - self.voxel_mean) / self.voxel_std
+        item["metadata"] = {
+            **item["metadata"],
+            "repeat_count": len(selected),
+            "available_repeats": len(group),
+            "group_index": index,
+        }
+        return item
+
+
+def make_repeat_averaged_loaders(
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    test_loader: DataLoader,
+    batch_size: int,
+    num_workers: int,
+) -> tuple[DataLoader, DataLoader, DataLoader, torch.Tensor, torch.Tensor]:
+    mean, std = compute_train_voxel_stats(train_loader.dataset)
+    datasets = [
+        RepeatAveragedDataset(train_loader.dataset, mean, std, random_subsets=True),
+        RepeatAveragedDataset(val_loader.dataset, mean, std, random_subsets=False),
+        RepeatAveragedDataset(test_loader.dataset, mean, std, random_subsets=False),
+    ]
+    loaders = [
+        DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=index == 0,
+            num_workers=num_workers,
+            collate_fn=collate_nsd_concepts,
+            pin_memory=torch.cuda.is_available(),
+        )
+        for index, dataset in enumerate(datasets)
+    ]
+    return loaders[0], loaders[1], loaders[2], mean, std
 
 
 def masked_caption_mean(captions: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -418,6 +498,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pool-num", type=int, default=8192)
     parser.add_argument("--pool-type", choices=["max", "avg"], default="max")
     parser.add_argument("--normalize", choices=["none", "volume"], default="volume")
+    parser.add_argument("--average-repeats", type=str2bool, default=True)
+    parser.add_argument("--voxel-normalize", type=str2bool, default=True)
     parser.add_argument("--image-soft-clip-weight", type=float, default=1.0)
     parser.add_argument("--text-soft-clip-weight", type=float, default=1.0)
     parser.add_argument("--image-mse-weight", type=float, default=1000.0)
@@ -437,6 +519,7 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.jsonl"
 
+    base_normalize = "none" if args.voxel_normalize else args.normalize
     train_loader, val_loader, test_loader = create_dataloaders(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -449,10 +532,19 @@ def main() -> None:
         fmri_format="1d",
         subject=args.subject,
         seed=args.seed,
-        normalize=args.normalize,
+        normalize=base_normalize,
         include_vae_latents=False,
         include_raw=False,
     )
+    voxel_mean = voxel_std = None
+    if args.average_repeats or args.voxel_normalize:
+        train_loader, val_loader, test_loader, voxel_mean, voxel_std = make_repeat_averaged_loaders(
+            train_loader,
+            val_loader,
+            test_loader,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
     first_batch = next(iter(train_loader))
     raw_in_dim = int(first_batch["fmri"].shape[-1])
     model_in_dim = args.pool_num if args.enable_pool else raw_in_dim
@@ -486,6 +578,8 @@ def main() -> None:
         "device": str(device),
         "parameters": sum(p.numel() for p in model.parameters()),
         "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        "repeat_averaged": bool(args.average_repeats),
+        "voxel_normalized": bool(args.voxel_normalize),
     }
     with (run_dir / "config.json").open("w", encoding="utf-8") as f:
         json.dump(config_payload, f, ensure_ascii=False, indent=2)
@@ -539,7 +633,13 @@ def main() -> None:
                 best_score = val_score
                 best_epoch = epoch
                 torch.save(
-                    {"model_state_dict": model.state_dict(), "model_config": asdict(model_cfg), "epoch": epoch},
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "model_config": asdict(model_cfg),
+                        "epoch": epoch,
+                        "voxel_mean": voxel_mean,
+                        "voxel_std": voxel_std,
+                    },
                     run_dir / "best_model.pt",
                 )
             message += (
@@ -555,7 +655,13 @@ def main() -> None:
         save_jsonl(metrics_path, payload)
 
     torch.save(
-        {"model_state_dict": model.state_dict(), "model_config": asdict(model_cfg), "epoch": args.epochs},
+        {
+            "model_state_dict": model.state_dict(),
+            "model_config": asdict(model_cfg),
+            "epoch": args.epochs,
+            "voxel_mean": voxel_mean,
+            "voxel_std": voxel_std,
+        },
         run_dir / "last_model.pt",
     )
     best_path = run_dir / "best_model.pt"
