@@ -43,6 +43,7 @@ class Mind1DConfig:
     n_blocks: int = 2
     adapter_bottleneck: int = 128
     dropout: float = 0.5
+    shared_semantic_head: bool = False
 
 
 @dataclass
@@ -52,6 +53,8 @@ class LossConfig:
     image_mse_weight: float = 1.0
     text_mse_weight: float = 1.0
     soft_clip_temp: float = 0.005
+    text_loss_weight: float = 1.0
+    caption_target_mode: str = "mean"
 
 
 class AdapterLayer(nn.Module):
@@ -110,14 +113,14 @@ class Mind1D(nn.Module):
         )
         self.translator = ResMLP(config.hidden_dim, config.n_blocks, config.dropout)
         self.head_image = nn.Linear(config.hidden_dim, config.out_dim)
-        self.head_text = nn.Linear(config.hidden_dim, config.out_dim)
+        self.head_text = None if config.shared_semantic_head else nn.Linear(config.hidden_dim, config.out_dim)
 
     def forward(self, fmri: torch.Tensor) -> dict[str, torch.Tensor]:
         if fmri.ndim != 2:
             raise ValueError(f"Expected 1D fMRI tensor [B,V], got {tuple(fmri.shape)}.")
         hidden = self.translator(self.embedder(fmri))
         pred_image = self.head_image(hidden)
-        pred_text = self.head_text(hidden)
+        pred_text = pred_image if self.head_text is None else self.head_text(hidden)
         return {
             "image_embedding": F.normalize(pred_image, dim=-1),
             "text_embedding": F.normalize(pred_text, dim=-1),
@@ -234,6 +237,20 @@ def masked_caption_mean(captions: torch.Tensor, mask: torch.Tensor) -> torch.Ten
     return (captions * mask_f).sum(dim=1) / denom
 
 
+def select_closest_caption(
+    prediction: torch.Tensor,
+    captions: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    prediction = F.normalize(prediction.detach(), dim=-1)
+    captions_normalized = F.normalize(captions, dim=-1)
+    similarities = torch.einsum("bd,bnd->bn", prediction, captions_normalized)
+    similarities = similarities.masked_fill(~mask.bool(), -torch.inf)
+    best_index = similarities.argmax(dim=1)
+    batch_index = torch.arange(captions.shape[0], device=captions.device)
+    return captions[batch_index, best_index], best_index
+
+
 def soft_clip_loss(preds: torch.Tensor, targets: torch.Tensor, temp: float = 0.005) -> torch.Tensor:
     preds = F.normalize(preds, dim=-1)
     targets = F.normalize(targets, dim=-1)
@@ -251,7 +268,13 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, Any], cfg: L
     image_target = F.normalize(batch["image_embeddings"].to(pred_image.device, pred_image.dtype), dim=-1)
     caption_embeddings = batch["caption_text_embeddings"].to(pred_text.device, pred_text.dtype)
     caption_mask = batch["caption_mask"].to(pred_text.device)
-    text_target = F.normalize(masked_caption_mean(caption_embeddings, caption_mask), dim=-1)
+    if cfg.caption_target_mode == "best":
+        text_target_raw, _ = select_closest_caption(pred_image, caption_embeddings, caption_mask)
+    elif cfg.caption_target_mode == "mean":
+        text_target_raw = masked_caption_mean(caption_embeddings, caption_mask)
+    else:
+        raise ValueError(f"Unknown caption_target_mode: {cfg.caption_target_mode}")
+    text_target = F.normalize(text_target_raw, dim=-1)
 
     image_soft = soft_clip_loss(pred_image, image_target, temp=cfg.soft_clip_temp)
     text_soft = soft_clip_loss(pred_text, text_target, temp=cfg.soft_clip_temp)
@@ -259,9 +282,9 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, Any], cfg: L
     text_mse = F.mse_loss(pred_text, text_target)
     loss = (
         cfg.image_soft_clip_weight * image_soft
-        + cfg.text_soft_clip_weight * text_soft
+        + cfg.text_loss_weight * cfg.text_soft_clip_weight * text_soft
         + cfg.image_mse_weight * image_mse
-        + cfg.text_mse_weight * text_mse
+        + cfg.text_loss_weight * cfg.text_mse_weight * text_mse
     )
     return {
         "loss": loss,
@@ -333,6 +356,7 @@ def collect_predictions(
     model: Mind1D,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
+    loss_cfg: LossConfig,
     enable_pool: bool,
     pool_num: int,
     pool_type: str,
@@ -348,13 +372,15 @@ def collect_predictions(
         )
         outputs = model(fmri)
         image_target = F.normalize(batch["image_embeddings"].to(device=device, dtype=outputs["image_embedding"].dtype), dim=-1)
-        text_target = F.normalize(
-            masked_caption_mean(
-                batch["caption_text_embeddings"].to(device=device, dtype=outputs["text_embedding"].dtype),
-                batch["caption_mask"].to(device),
-            ),
-            dim=-1,
+        caption_embeddings = batch["caption_text_embeddings"].to(
+            device=device, dtype=outputs["text_embedding"].dtype
         )
+        caption_mask = batch["caption_mask"].to(device)
+        if loss_cfg.caption_target_mode == "best":
+            text_target, _ = select_closest_caption(outputs["image_embedding"], caption_embeddings, caption_mask)
+        else:
+            text_target = masked_caption_mean(caption_embeddings, caption_mask)
+        text_target = F.normalize(text_target, dim=-1)
         pred_img.append(outputs["image_embedding"].detach().cpu())
         pred_txt.append(outputs["text_embedding"].detach().cpu())
         targ_img.append(image_target.detach().cpu())
@@ -422,6 +448,7 @@ def evaluate_model(
             model=model,
             loader=loader,
             device=device,
+            loss_cfg=loss_cfg,
             enable_pool=enable_pool,
             pool_num=pool_num,
             pool_type=pool_type,
@@ -504,6 +531,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-soft-clip-weight", type=float, default=1.0)
     parser.add_argument("--image-mse-weight", type=float, default=1000.0)
     parser.add_argument("--text-mse-weight", type=float, default=1000.0)
+    parser.add_argument("--text-loss-weight", type=float, default=1.0)
+    parser.add_argument("--caption-target-mode", choices=["mean", "best"], default="mean")
+    parser.add_argument("--shared-semantic-head", type=str2bool, default=False)
     parser.add_argument("--soft-clip-temp", type=float, default=0.005)
     parser.add_argument("--two-way-trials", type=int, default=200)
     return parser.parse_args()
@@ -557,6 +587,7 @@ def main() -> None:
         n_blocks=args.n_blocks,
         adapter_bottleneck=args.adapter_bottleneck,
         dropout=args.dropout,
+        shared_semantic_head=args.shared_semantic_head,
     )
     loss_cfg = LossConfig(
         image_soft_clip_weight=args.image_soft_clip_weight,
@@ -564,6 +595,8 @@ def main() -> None:
         image_mse_weight=args.image_mse_weight,
         text_mse_weight=args.text_mse_weight,
         soft_clip_temp=args.soft_clip_temp,
+        text_loss_weight=args.text_loss_weight,
+        caption_target_mode=args.caption_target_mode,
     )
     model = Mind1D(model_cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
