@@ -105,7 +105,7 @@ def experiment_files() -> list[str]:
         "find output -maxdepth 6 -type f "
         "\\( -name metrics.jsonl -o -name config.json -o -name test_metrics.json "
         "-o -name '*.png' -o -name '*.jpg' -o -name '*.jpeg' -o -name '*.webp' \\) "
-        "-printf '%T@|%p\\n' 2>/dev/null | sort -nr | head -1000"
+        "-printf '%T@|%p\\n' 2>/dev/null | sort -nr | head -5000"
     )
     rows = []
     for line in str(ssh(command, timeout=30)).splitlines():
