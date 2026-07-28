@@ -48,8 +48,9 @@ def main() -> None:
     g = TEMP / "G_retrain"
     TEMP.mkdir(parents=True, exist_ok=True)
     try:
-        status("training_s7")
-        run(
+        if not (s7 / "best_model.pt").exists():
+            status("training_s7")
+            run(
             [
                 PYTHON,
                 "models/train_base_model_1D.py",
@@ -66,10 +67,11 @@ def main() -> None:
                 "--text-mse-weight", "1000.0",
                 "--text-loss-weight", "1.0",
             ]
-        )
+            )
 
-        status("training_g")
-        run(
+        if not (g / "best_low_model.pt").exists():
+            status("training_g")
+            run(
             [
                 PYTHON,
                 "models/train_low_model_structured.py",
@@ -89,7 +91,7 @@ def main() -> None:
                 "--fixed-samples-per-split", "5",
                 "--delete-checkpoints-after-run", "false",
             ]
-        )
+            )
 
         status("generating", samples=50)
         run(

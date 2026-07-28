@@ -22,7 +22,15 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dataloader import create_dataloaders  # noqa: E402
+from dataloader import (  # noqa: E402
+    DEFAULT_ANNOTATION_DIR,
+    DEFAULT_BETAS_1D_PATH,
+    DEFAULT_CAPTION_EMBEDDINGS_PATH,
+    DEFAULT_IMAGE_EMBEDDINGS_PATH,
+    DEFAULT_STIM_INFO_PATH,
+    DEFAULT_STIMULUS_H5_PATH,
+    create_dataloaders,
+)
 from models.generate_s7_g_controlnet import (  # noqa: E402
     collect_test_predictions,
     evaluate_run,
@@ -39,6 +47,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--g-checkpoint", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, default=Path("output/fusion_retrieval_50"))
     parser.add_argument("--model-root", type=Path, default=ROOT / "save_pt")
+    parser.add_argument("--annotation-dir", type=Path, default=DEFAULT_ANNOTATION_DIR)
+    parser.add_argument("--stim-info-path", type=Path, default=DEFAULT_STIM_INFO_PATH)
+    parser.add_argument("--betas-1d-path", type=Path, default=DEFAULT_BETAS_1D_PATH)
+    parser.add_argument("--caption-embeddings-path", type=Path, default=DEFAULT_CAPTION_EMBEDDINGS_PATH)
+    parser.add_argument("--image-embeddings-path", type=Path, default=DEFAULT_IMAGE_EMBEDDINGS_PATH)
+    parser.add_argument("--stimulus-h5-path", type=Path, default=DEFAULT_STIMULUS_H5_PATH)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--samples", type=int, default=50)
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--steps", type=int, default=30)
