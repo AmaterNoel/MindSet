@@ -92,13 +92,7 @@ def gpu_snapshot() -> list[dict[str, Any]]:
 def wait_for_idle_gpu(min_free_mb: int, poll_seconds: int, log_path: Path) -> int:
     while True:
         first = gpu_snapshot()
-        candidates = [
-            gpu
-            for gpu in first
-            if not gpu["has_compute_process"]
-            and gpu["free"] >= min_free_mb
-            and gpu["utilization"] <= 10
-        ]
+        candidates = [gpu for gpu in first if gpu["free"] >= min_free_mb]
         if candidates:
             time.sleep(10)
             second = {gpu["index"]: gpu for gpu in gpu_snapshot()}
@@ -106,15 +100,23 @@ def wait_for_idle_gpu(min_free_mb: int, poll_seconds: int, log_path: Path) -> in
                 gpu
                 for gpu in candidates
                 if gpu["index"] in second
-                and not second[gpu["index"]]["has_compute_process"]
                 and second[gpu["index"]]["free"] >= min_free_mb
-                and second[gpu["index"]]["utilization"] <= 10
+                and second[gpu["index"]]["free"] >= gpu["free"] - 1024
             ]
             if stable:
-                chosen = max(stable, key=lambda gpu: second[gpu["index"]]["free"])
+                idle = [
+                    gpu
+                    for gpu in stable
+                    if not second[gpu["index"]]["has_compute_process"]
+                    and second[gpu["index"]]["utilization"] <= 10
+                ]
+                pool = idle or stable
+                chosen = max(pool, key=lambda gpu: second[gpu["index"]]["free"])
                 log(
                     f"selected GPU {chosen['index']} "
-                    f"(free={second[chosen['index']]['free']} MiB, util={second[chosen['index']]['utilization']}%)",
+                    f"(free={second[chosen['index']]['free']} MiB, "
+                    f"util={second[chosen['index']]['utilization']}%, "
+                    f"shared={second[chosen['index']]['has_compute_process']})",
                     log_path,
                 )
                 return int(chosen["index"])
@@ -246,7 +248,7 @@ def main() -> None:
 
             training_gpu = run_stage_with_gpu_retries(
                 lambda: train_command(experiment, args.output_root),
-                4096,
+                8192,
                 args.poll_seconds,
                 run_dir / "train.log",
                 suite_log,
@@ -273,7 +275,7 @@ def main() -> None:
                     "--device",
                     "cuda",
                 ],
-                12288,
+                16384,
                 args.poll_seconds,
                 run_dir / "generation.log",
                 suite_log,
