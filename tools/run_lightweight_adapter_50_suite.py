@@ -73,8 +73,9 @@ def main() -> None:
     TEMP.mkdir(parents=True, exist_ok=True)
     try:
         gpu = wait_gpu()
-        status("training_S7", gpu=gpu)
-        run(
+        if not (s7 / "best_model.pt").exists():
+            status("training_S7", gpu=gpu)
+            run(
             [
                 PYTHON, "models/train_base_model_1D.py",
                 "--epochs", "30", "--eval-every", "1", "--batch-size", "256",
@@ -84,11 +85,12 @@ def main() -> None:
                 "--text-soft-clip-weight", "1.0", "--text-mse-weight", "1000.0",
                 "--text-loss-weight", "1.0",
             ],
-            gpu,
-        )
+                gpu,
+            )
         gpu = wait_gpu()
-        status("training_G", gpu=gpu)
-        run(
+        if not (g / "best_low_model.pt").exists():
+            status("training_G", gpu=gpu)
+            run(
             [
                 PYTHON, "models/train_low_model_structured.py",
                 "--epochs", "30", "--eval-every", "5", "--batch-size", "64",
@@ -99,11 +101,12 @@ def main() -> None:
                 "--reliability-gate", "false", "--fixed-samples-per-split", "5",
                 "--delete-checkpoints-after-run", "false",
             ],
-            gpu,
-        )
+                gpu,
+            )
         gpu = wait_gpu()
-        status("training_adapters", gpu=gpu)
-        run(
+        if not adapter.exists():
+            status("training_adapters", gpu=gpu)
+            run(
             [
                 PYTHON, "models/train_lightweight_fusion_adapters.py",
                 "--s7-checkpoint", str(s7 / "best_model.pt"),
@@ -111,8 +114,8 @@ def main() -> None:
                 "--output", str(adapter), "--epochs", "20",
                 "--batch-size", "128", "--device", "cuda",
             ],
-            gpu,
-        )
+                gpu,
+            )
         gpu = wait_gpu()
         status("generating_and_public_evaluation", gpu=gpu, samples=50)
         run(
