@@ -28,38 +28,36 @@ def status(stage: str, **extra: object) -> None:
     )
 
 
-def idle_gpu(min_free_mib: int = 26000) -> int | None:
+def available_gpu(min_free_mib: int = 30000) -> int | None:
     query = subprocess.run(
         [
             "nvidia-smi",
-            "--query-gpu=index,uuid,memory.free",
+            "--query-gpu=index,memory.free,utilization.gpu",
             "--format=csv,noheader,nounits",
         ],
         check=True,
         capture_output=True,
         text=True,
     ).stdout
-    active = subprocess.run(
-        ["nvidia-smi", "--query-compute-apps=gpu_uuid", "--format=csv,noheader,nounits"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    active_uuids = {line.strip() for line in active.splitlines() if line.strip()}
     candidates = []
     for line in query.splitlines():
-        index, uuid, free = [part.strip() for part in line.split(",")]
-        if uuid not in active_uuids and int(free) >= min_free_mib:
-            candidates.append((int(free), int(index)))
-    return max(candidates)[1] if candidates else None
+        index, free, utilization = [part.strip() for part in line.split(",")]
+        if int(index) in {1, 5} and int(free) >= min_free_mib:
+            candidates.append((int(utilization), -int(free), int(index)))
+    return min(candidates)[2] if candidates else None
 
 
 def wait_for_gpu() -> int:
     while True:
-        gpu = idle_gpu()
+        gpu = available_gpu()
         if gpu is not None:
             return gpu
-        status("waiting_for_idle_gpu", poll_seconds=300)
+        status(
+            "waiting_for_shared_gpu",
+            allowed_gpus=[1, 5],
+            minimum_free_mib=30000,
+            poll_seconds=300,
+        )
         time.sleep(300)
 
 
